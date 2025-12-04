@@ -20,7 +20,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 TOKEN = os.environ.get("DISCORD_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-ADMIN_ID = 783542452756938813  # replace with your Discord user ID
+ADMIN_ID = 123456789012345678  # replace with your Discord ID
 
 db_pool: asyncpg.pool.Pool = None
 
@@ -59,12 +59,24 @@ async def create_tables():
             numbers TEXT,
             date TIMESTAMP DEFAULT NOW()
         )""")
+        logger.info("Tables checked/created.")
 
 async def get_db_pool():
     global db_pool
     if not db_pool:
-        db_pool = await asyncpg.create_pool(DATABASE_URL)
-        logger.info("Database pool created.")
+        retry = 0
+        while retry < 5:
+            try:
+                db_pool = await asyncpg.create_pool(DATABASE_URL, max_size=10)
+                logger.info("Database pool created.")
+                break
+            except Exception as e:
+                logger.error(f"Database connection failed: {e}. Retrying in 5s...")
+                await asyncio.sleep(5)
+                retry += 1
+        if not db_pool:
+            logger.critical("Cannot connect to database after multiple attempts.")
+            raise Exception("DB connection failed.")
     return db_pool
 
 # -------------------- User Helpers --------------------
@@ -90,6 +102,11 @@ async def register_user(user: discord.User, guild_id: int):
         )
         await create_user(user.id)
         return True
+
+async def is_registered(user_id: int):
+    async with db_pool.acquire() as conn:
+        reg = await conn.fetchrow("SELECT 1 FROM registrations WHERE user_id=$1", user_id)
+        return bool(reg)
 
 # -------------------- XP & Level + Prestige --------------------
 async def add_xp(user_id: int, base_amount: int = 5):
@@ -127,7 +144,7 @@ async def add_xp(user_id: int, base_amount: int = 5):
 
         await conn.execute("UPDATE users SET xp=$1, level=$2 WHERE user_id=$3", new_xp, level, user_id)
 
-        # Send DM embed
+        # DM embed
         user_obj = bot.get_user(user_id)
         if leveled_up:
             if prestige_up:
@@ -149,37 +166,41 @@ async def add_xp(user_id: int, base_amount: int = 5):
 
         return leveled_up, level, prestige_up, prestige
 
-# -------------------- Interaction XP --------------------
+# -------------------- Slash Command Sync --------------------
 @bot.event
-async def on_interaction(interaction: discord.Interaction):
-    if interaction.type == discord.InteractionType.application_command:
-        xp_map = {
-            "slot": 10, "coinflip": 10, "roulette": 10, "daily": 20,
-            "buy": 10, "sell": 10, "stocks": 5, "graph": 5,
-            "give": 5, "lottery": 5, "bank": 2, "leaderboard": 2,
-        }
-        xp = xp_map.get(interaction.command.name, 5)
-        leveled, new_level, prestige_up, prestige = await add_xp(interaction.user.id, xp)
-        if leveled and not prestige_up:
-            embed = discord.Embed(
-                title="Level Up!",
-                description=f"Congrats {interaction.user.mention}, you reached level **{new_level}**!",
-                color=discord.Color.gold()
-            )
-            try:
-                await interaction.channel.send(embed=embed)
-            except:
-                pass
+async def on_ready():
+    logger.info(f"Bot logged in as {bot.user}")
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} slash commands.")
+    except Exception as e:
+        logger.error(f"Error syncing commands: {e}")
+
+# -------------------- Register Command --------------------
+@bot.tree.command(name="register", description="Register yourself to use the bot.")
+async def register(interaction: discord.Interaction):
+    await interaction.response.defer()
+    registered = await register_user(interaction.user, interaction.guild_id)
+    if registered:
+        await interaction.followup.send(f"{interaction.user.mention}, you are now registered!")
+    else:
+        await interaction.followup.send(f"{interaction.user.mention}, you are already registered.")
+
+# -------------------- Decorator to Check Registration --------------------
+def require_registration():
+    async def predicate(interaction: discord.Interaction):
+        if not await is_registered(interaction.user.id):
+            await interaction.response.send_message("You must register first using `/register`.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
 
 # -------------------- Daily Command --------------------
 @bot.tree.command(name="daily", description="Claim daily ARC reward.")
+@require_registration()
 async def daily(interaction: discord.Interaction):
     await interaction.response.defer()
     user = await get_user(interaction.user.id)
-    if not user:
-        await create_user(interaction.user.id)
-        user = await get_user(interaction.user.id)
-
     now = datetime.utcnow()
     last_claim = user['last_give_reset'] or datetime(2000,1,1)
     streak = user['streak']
@@ -193,17 +214,13 @@ async def daily(interaction: discord.Interaction):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET wallet=wallet+$1, streak=$2, last_give_reset=$3 WHERE user_id=$4",
                            reward, new_streak, now, interaction.user.id)
-
     await add_xp(interaction.user.id, 20)
-    embed = discord.Embed(
-        title="Daily Claimed!",
-        description=f"You received **{reward} ARC**.\nCurrent streak: **{new_streak}**",
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title="Daily Claimed!", description=f"You received **{reward} ARC**.\nCurrent streak: **{new_streak}**", color=discord.Color.blue())
     await interaction.followup.send(embed=embed)
 
 # -------------------- Gambling Commands --------------------
 @bot.tree.command(name="slot", description="Play slot machine.")
+@require_registration()
 async def slot(interaction: discord.Interaction, bet: int):
     await interaction.response.defer()
     user = await get_user(interaction.user.id)
@@ -219,7 +236,9 @@ async def slot(interaction: discord.Interaction, bet: int):
     await add_xp(interaction.user.id, 10)
     await interaction.followup.send(f"{' '.join(result)}\n{'You won!' if win else 'You lost!'} {abs(payout)} ARC")
 
+# -------------------- Coinflip --------------------
 @bot.tree.command(name="coinflip", description="Flip a coin and bet ARC.")
+@require_registration()
 async def coinflip(interaction: discord.Interaction, bet: int, choice: str):
     await interaction.response.defer()
     user = await get_user(interaction.user.id)
@@ -235,7 +254,9 @@ async def coinflip(interaction: discord.Interaction, bet: int, choice: str):
     await add_xp(interaction.user.id, 10)
     await interaction.followup.send(f"The coin landed on **{result}**.\n{'You won!' if win else 'You lost!'} {abs(payout)} ARC")
 
+# -------------------- Roulette --------------------
 @bot.tree.command(name="roulette", description="Play roulette and bet ARC.")
+@require_registration()
 async def roulette(interaction: discord.Interaction, bet: int, color: str):
     await interaction.response.defer()
     user = await get_user(interaction.user.id)
@@ -251,7 +272,9 @@ async def roulette(interaction: discord.Interaction, bet: int, color: str):
     await add_xp(interaction.user.id, 10)
     await interaction.followup.send(f"Roulette landed on **{result}**.\n{'You won!' if win else 'You lost!'} {abs(payout)} ARC")
 
+# -------------------- Lottery --------------------
 @bot.tree.command(name="lottery", description="Buy a lottery ticket (5 numbers).")
+@require_registration()
 async def lottery(interaction: discord.Interaction, numbers: str):
     await interaction.response.defer()
     numbers_list = numbers.split(',')
@@ -265,6 +288,7 @@ async def lottery(interaction: discord.Interaction, numbers: str):
 
 # -------------------- Give Command --------------------
 @bot.tree.command(name="give", description="Give ARC to another user.")
+@require_registration()
 @app_commands.describe(user="Recipient", amount="Amount to give")
 async def give(interaction: discord.Interaction, user: discord.Member, amount: int):
     await interaction.response.defer()
@@ -294,6 +318,7 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
 
 # -------------------- Stocks + Graph --------------------
 @bot.tree.command(name="stocks", description="Show all stocks with prices and graph.")
+@require_registration()
 async def stocks(interaction: discord.Interaction):
     await interaction.response.defer()
     async with db_pool.acquire() as conn:
@@ -318,14 +343,16 @@ async def stocks(interaction: discord.Interaction):
 
 # -------------------- Leaderboards --------------------
 @bot.tree.command(name="leaderboard", description="Show worldwide leaderboard for ARC.")
+@require_registration()
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id, wallet+bank as total FROM users ORDER BY total DESC LIMIT 10")
     desc = ""
     for i, r in enumerate(rows, 1):
-        user_obj = bot.get_user(r['user_id'])
-        desc += f"**{i}. {user_obj}** - {r['total']} ARC\n"
+        user = bot.get_user(r['user_id'])
+        if user:
+            desc += f"**{i}. {user}** - {r['total']} ARC\n"
     embed = discord.Embed(title="Worldwide Leaderboard", description=desc)
     await interaction.followup.send(embed=embed)
 
