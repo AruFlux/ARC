@@ -46,6 +46,7 @@ class MyBot(discord.Client):
     def __init__(self, *, intents):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.token = TOKEN
 
     async def setup_hook(self):
         # Database connection
@@ -63,7 +64,6 @@ async def is_admin(interaction: discord.Interaction):
     return interaction.user.id == ADMIN_ID
 
 # --- Commands ---
-
 @bot.tree.command(name="register", description="Create an ARC account.")
 async def register(interaction: discord.Interaction):
     await create_user(interaction.user.id)
@@ -178,4 +178,3 @@ async def addarc(interaction: discord.Interaction, user: discord.Member, amount:
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET wallet=wallet+$1 WHERE user_id=$2", amount, user.id)
     await interaction.response.send_message(f"Added {amount} ARC to {user.name}.", ephemeral=True)
-
