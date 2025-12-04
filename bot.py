@@ -1,4 +1,3 @@
-# bot.py
 import discord
 from discord import app_commands
 import asyncpg
@@ -6,6 +5,7 @@ import os
 import random
 import time
 import asyncio
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,12 +14,27 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-intents = discord.Intents.all()
+# --- Logging setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("ARCgambler")
 
-# --- Database ---
+intents = discord.Intents.all()
 db_pool = None
+
+# --- Database helpers ---
 async def get_db_pool():
-    return await asyncpg.create_pool(DATABASE_URL)
+    global db_pool
+    try:
+        pool = await asyncpg.create_pool(DATABASE_URL)
+        logger.info("Database pool created successfully.")
+        return pool
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        raise e
 
 async def get_user(user_id):
     async with db_pool.acquire() as conn:
@@ -29,10 +44,9 @@ async def create_user(user_id):
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", user_id)
 
-# --- Database Initialization ---
+# --- Database setup ---
 async def setup_database():
     async with db_pool.acquire() as conn:
-        # Users table
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -41,14 +55,12 @@ async def setup_database():
             last_daily BIGINT DEFAULT 0
         )
         """)
-        # Stocks table
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS stocks (
             symbol TEXT PRIMARY KEY,
             price BIGINT DEFAULT 100
         )
         """)
-        # User stocks table
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_stocks (
             user_id BIGINT,
@@ -59,7 +71,6 @@ async def setup_database():
             FOREIGN KEY(symbol) REFERENCES stocks(symbol)
         )
         """)
-        # Insert default stocks if empty
         await conn.execute("""
         INSERT INTO stocks(symbol, price) VALUES
         ('ARC', 100),
@@ -67,20 +78,25 @@ async def setup_database():
         ('ETH', 300)
         ON CONFLICT(symbol) DO NOTHING
         """)
+    logger.info("Database tables setup completed.")
 
-# --- Stock updater ---
+# --- Stock updater task ---
 async def update_stocks():
     await bot.wait_until_ready()
+    logger.info("Stock updater task running.")
     while True:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT symbol, price FROM stocks")
-            for row in rows:
-                change = random.randint(-10, 15)
-                new_price = max(1, row['price'] + change)
-                await conn.execute("UPDATE stocks SET price=$1 WHERE symbol=$2", new_price, row['symbol'])
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT symbol, price FROM stocks")
+                for row in rows:
+                    change = random.randint(-10, 15)
+                    new_price = max(1, row['price'] + change)
+                    await conn.execute("UPDATE stocks SET price=$1 WHERE symbol=$2", new_price, row['symbol'])
+        except Exception as e:
+            logger.error(f"Error in update_stocks: {e}")
         await asyncio.sleep(20)
 
-# --- Bot Class ---
+# --- Bot class ---
 class MyBot(discord.Client):
     def __init__(self, *, intents):
         super().__init__(intents=intents)
@@ -90,9 +106,10 @@ class MyBot(discord.Client):
     async def setup_hook(self):
         global db_pool
         db_pool = await get_db_pool()
-        await setup_database()          # <--- create tables automatically
+        await setup_database()
         self.loop.create_task(update_stocks())
         await self.tree.sync()
+        logger.info("Slash commands synced.")
 
 bot = MyBot(intents=intents)
 
@@ -101,76 +118,83 @@ async def is_admin(interaction: discord.Interaction):
     return interaction.user.id == ADMIN_ID
 
 # --- Commands ---
+
 @bot.tree.command(name="register", description="Create an ARC account.")
 async def register(interaction: discord.Interaction):
+    await interaction.response.defer()
     await create_user(interaction.user.id)
-    await interaction.response.send_message("ARC account created. Wallet: 1000 ARC, Bank: 0 ARC.")
+    await interaction.followup.send("ARC account created. Wallet: 1000 ARC, Bank: 0 ARC.")
 
 @bot.tree.command(name="bank", description="Check your wallet and bank balances.")
 async def bank(interaction: discord.Interaction):
+    await interaction.response.defer()
     user = await get_user(interaction.user.id)
     embed = discord.Embed(title=f"{interaction.user.name}'s Bank Summary", color=discord.Color.blue())
     embed.add_field(name="Wallet", value=f"{user['wallet']} ARC")
     embed.add_field(name="Bank", value=f"{user['bank']} ARC")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="deposit", description="Deposit ARC from wallet to bank.")
 @app_commands.describe(amount="Amount to deposit")
 async def deposit(interaction: discord.Interaction, amount: int):
+    await interaction.response.defer()
     user = await get_user(interaction.user.id)
     if amount <= 0 or amount > user['wallet']:
-        await interaction.response.send_message("Invalid deposit amount.")
+        await interaction.followup.send("Invalid deposit amount.")
         return
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET wallet=wallet-$1, bank=bank+$1 WHERE user_id=$2", amount, interaction.user.id)
-    await interaction.response.send_message(f"Deposited {amount} ARC to bank.")
+    await interaction.followup.send(f"Deposited {amount} ARC to bank.")
 
 @bot.tree.command(name="withdraw", description="Withdraw ARC from bank to wallet.")
 @app_commands.describe(amount="Amount to withdraw")
 async def withdraw(interaction: discord.Interaction, amount: int):
+    await interaction.response.defer()
     user = await get_user(interaction.user.id)
     if amount <= 0 or amount > user['bank']:
-        await interaction.response.send_message("Invalid withdraw amount.")
+        await interaction.followup.send("Invalid withdraw amount.")
         return
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET wallet=wallet+$1, bank=bank-$1 WHERE user_id=$2", amount, interaction.user.id)
-    await interaction.response.send_message(f"Withdrew {amount} ARC to wallet.")
+    await interaction.followup.send(f"Withdrew {amount} ARC to wallet.")
 
 @bot.tree.command(name="daily", description="Claim daily ARC reward.")
 async def daily(interaction: discord.Interaction):
+    await interaction.response.defer()
     user = await get_user(interaction.user.id)
     now = int(time.time())
     if now - user['last_daily'] < 86400:
-        await interaction.response.send_message("Daily reward already claimed. Try later.")
+        await interaction.followup.send("Daily reward already claimed. Try later.")
         return
     reward = 150
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET wallet=wallet+$1, last_daily=$2 WHERE user_id=$3", reward, now, interaction.user.id)
-    await interaction.response.send_message(f"Claimed {reward} ARC daily reward.")
+    await interaction.followup.send(f"Claimed {reward} ARC daily reward.")
 
-# --- Stocks ---
 @bot.tree.command(name="stocks", description="View all stock prices.")
 async def stocks(interaction: discord.Interaction):
+    await interaction.response.defer()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT symbol, price FROM stocks")
     embed = discord.Embed(title="Stock Prices", color=discord.Color.blue())
     for row in rows:
         embed.add_field(name=row['symbol'], value=f"{row['price']} ARC", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="buy", description="Buy shares from the stock market.")
 @app_commands.describe(symbol="Stock symbol", amount="Amount to buy")
 async def buy(interaction: discord.Interaction, symbol: str, amount: int):
+    await interaction.response.defer()
     symbol = symbol.upper()
     user = await get_user(interaction.user.id)
     async with db_pool.acquire() as conn:
         stock = await conn.fetchrow("SELECT * FROM stocks WHERE symbol=$1", symbol)
         if not stock:
-            await interaction.response.send_message("Stock does not exist.")
+            await interaction.followup.send("Stock does not exist.")
             return
         total = stock['price'] * amount
         if amount <= 0 or user['wallet'] < total:
-            await interaction.response.send_message("Insufficient wallet balance.")
+            await interaction.followup.send("Insufficient wallet balance.")
             return
         await conn.execute("UPDATE users SET wallet=wallet-$1 WHERE user_id=$2", total, interaction.user.id)
         await conn.execute("""
@@ -178,15 +202,15 @@ async def buy(interaction: discord.Interaction, symbol: str, amount: int):
             VALUES($1,$2,$3)
             ON CONFLICT(user_id,symbol) DO UPDATE SET amount=user_stocks.amount+$3
         """, interaction.user.id, symbol, amount)
-    await interaction.response.send_message(f"Bought {amount} shares of {symbol} for {total} ARC.")
+    await interaction.followup.send(f"Bought {amount} shares of {symbol} for {total} ARC.")
 
-# --- Slot Machine ---
 @bot.tree.command(name="slot", description="Play a slot machine.")
 @app_commands.describe(bet="Amount of ARC to bet")
 async def slot(interaction: discord.Interaction, bet: int):
+    await interaction.response.defer()
     user = await get_user(interaction.user.id)
     if bet <= 0 or user['wallet'] < bet:
-        await interaction.response.send_message("Invalid bet.")
+        await interaction.followup.send("Invalid bet.")
         return
     symbols = ["A","B","C","D","E"]
     result = [random.choice(symbols) for _ in range(3)]
@@ -202,20 +226,25 @@ async def slot(interaction: discord.Interaction, bet: int):
         embed.add_field(name="Outcome", value=f"You won {winnings} ARC!")
     else:
         embed.add_field(name="Outcome", value=f"You lost {bet} ARC.")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
-# --- Admin Example ---
 @bot.tree.command(name="addarc", description="Add ARC to a user (Admin only).")
 @app_commands.describe(user="User", amount="Amount to add")
 async def addarc(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await interaction.response.defer(ephemeral=True)
     if not await is_admin(interaction):
-        await interaction.response.send_message("You do not have permission.", ephemeral=True)
+        await interaction.followup.send("You do not have permission.", ephemeral=True)
         return
     await create_user(user.id)
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET wallet=wallet+$1 WHERE user_id=$2", amount, user.id)
-    await interaction.response.send_message(f"Added {amount} ARC to {user.name}.", ephemeral=True)
+    await interaction.followup.send(f"Added {amount} ARC to {user.name}.", ephemeral=True)
 
-# --- Run Bot ---
+# --- Ready event ---
+@bot.event
+async def on_ready():
+    logger.info(f"{bot.user} has connected to Discord!")
+
+# --- Run bot ---
 if __name__ == "__main__":
     bot.run(TOKEN)
