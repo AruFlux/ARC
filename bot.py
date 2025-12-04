@@ -64,6 +64,7 @@ async def get_db_pool():
     global db_pool
     if not db_pool:
         db_pool = await asyncpg.create_pool(DATABASE_URL)
+        logger.info("Database pool created.")
     return db_pool
 
 # -------------------- User Helpers --------------------
@@ -72,6 +73,7 @@ async def create_user(user_id: int):
         exists = await conn.fetchrow("SELECT 1 FROM users WHERE user_id=$1", user_id)
         if not exists:
             await conn.execute("INSERT INTO users(user_id) VALUES($1)", user_id)
+            logger.info(f"User {user_id} created.")
 
 async def get_user(user_id: int):
     async with db_pool.acquire() as conn:
@@ -89,7 +91,7 @@ async def register_user(user: discord.User, guild_id: int):
         await create_user(user.id)
         return True
 
-# -------------------- XP & Level --------------------
+# -------------------- XP & Level + Prestige --------------------
 async def add_xp(user_id: int, base_amount: int = 5):
     async with db_pool.acquire() as conn:
         user = await get_user(user_id)
@@ -99,8 +101,11 @@ async def add_xp(user_id: int, base_amount: int = 5):
 
         amount = int(base_amount * user['xp_multiplier'])
         new_xp = user['xp'] + amount
-        level = user['level']
         leveled_up = False
+        prestige_up = False
+        level = user['level']
+        prestige = user['prestige']
+        xp_multiplier = user['xp_multiplier']
 
         if level < 100:
             next_xp = 50 + (level * 100)
@@ -109,22 +114,40 @@ async def add_xp(user_id: int, base_amount: int = 5):
                 new_xp -= next_xp
                 leveled_up = True
         else:
-            prestige = user['prestige'] + 1
+            prestige += 1
             xp_multiplier = min(1 + 0.1 * prestige, 2.0)
             level = 1
             new_xp = 0
+            prestige_up = True
             leveled_up = True
             await conn.execute(
                 "UPDATE users SET prestige=$1, xp_multiplier=$2 WHERE user_id=$3",
                 prestige, xp_multiplier, user_id
             )
-            embed = discord.Embed(
-                title="Prestige Achieved!",
-                description=f"<@{user_id}> prestiged!\nXP multiplier is now **{xp_multiplier:.1f}×**!",
-                color=discord.Color.purple()
-            )
+
         await conn.execute("UPDATE users SET xp=$1, level=$2 WHERE user_id=$3", new_xp, level, user_id)
-        return leveled_up, level
+
+        # Send DM embed
+        user_obj = bot.get_user(user_id)
+        if leveled_up:
+            if prestige_up:
+                embed = discord.Embed(
+                    title="Prestige Achieved!",
+                    description=f"Congrats {user_obj.mention}! You prestiged!\nXP multiplier is now **{xp_multiplier:.1f}×**!",
+                    color=discord.Color.purple()
+                )
+            else:
+                embed = discord.Embed(
+                    title="Level Up!",
+                    description=f"Congrats {user_obj.mention}, you reached level **{level}**!",
+                    color=discord.Color.gold()
+                )
+            try:
+                await user_obj.send(embed=embed)
+            except:
+                pass
+
+        return leveled_up, level, prestige_up, prestige
 
 # -------------------- Interaction XP --------------------
 @bot.event
@@ -136,16 +159,19 @@ async def on_interaction(interaction: discord.Interaction):
             "give": 5, "lottery": 5, "bank": 2, "leaderboard": 2,
         }
         xp = xp_map.get(interaction.command.name, 5)
-        leveled, new_level = await add_xp(interaction.user.id, xp)
-        if leveled:
+        leveled, new_level, prestige_up, prestige = await add_xp(interaction.user.id, xp)
+        if leveled and not prestige_up:
             embed = discord.Embed(
                 title="Level Up!",
                 description=f"Congrats {interaction.user.mention}, you reached level **{new_level}**!",
                 color=discord.Color.gold()
             )
-            await interaction.channel.send(embed=embed)
+            try:
+                await interaction.channel.send(embed=embed)
+            except:
+                pass
 
-# -------------------- Daily --------------------
+# -------------------- Daily Command --------------------
 @bot.tree.command(name="daily", description="Claim daily ARC reward.")
 async def daily(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -154,17 +180,29 @@ async def daily(interaction: discord.Interaction):
         await create_user(interaction.user.id)
         user = await get_user(interaction.user.id)
 
-    last_claim = user['streak']
-    reward = 150 + user['streak']*10
-    new_streak = user['streak'] + 1
+    now = datetime.utcnow()
+    last_claim = user['last_give_reset'] or datetime(2000,1,1)
+    streak = user['streak']
 
+    if last_claim.date() == now.date():
+        await interaction.followup.send("You already claimed your daily today!")
+        return
+
+    new_streak = streak + 1
+    reward = 150 + (new_streak * 10)
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET wallet=wallet+$1, streak=$2 WHERE user_id=$3", reward, new_streak, interaction.user.id)
+        await conn.execute("UPDATE users SET wallet=wallet+$1, streak=$2, last_give_reset=$3 WHERE user_id=$4",
+                           reward, new_streak, now, interaction.user.id)
 
     await add_xp(interaction.user.id, 20)
-    await interaction.followup.send(f"You claimed **{reward} ARC**. Current streak: {new_streak}.")
+    embed = discord.Embed(
+        title="Daily Claimed!",
+        description=f"You received **{reward} ARC**.\nCurrent streak: **{new_streak}**",
+        color=discord.Color.blue()
+    )
+    await interaction.followup.send(embed=embed)
 
-# -------------------- Gambling --------------------
+# -------------------- Gambling Commands --------------------
 @bot.tree.command(name="slot", description="Play slot machine.")
 async def slot(interaction: discord.Interaction, bet: int):
     await interaction.response.defer()
@@ -225,7 +263,7 @@ async def lottery(interaction: discord.Interaction, numbers: str):
     await add_xp(interaction.user.id, 5)
     await interaction.followup.send("Lottery ticket bought!")
 
-# -------------------- Give ARC --------------------
+# -------------------- Give Command --------------------
 @bot.tree.command(name="give", description="Give ARC to another user.")
 @app_commands.describe(user="Recipient", amount="Amount to give")
 async def give(interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -286,8 +324,8 @@ async def leaderboard(interaction: discord.Interaction):
         rows = await conn.fetch("SELECT user_id, wallet+bank as total FROM users ORDER BY total DESC LIMIT 10")
     desc = ""
     for i, r in enumerate(rows, 1):
-        user = bot.get_user(r['user_id'])
-        desc += f"**{i}. {user}** - {r['total']} ARC\n"
+        user_obj = bot.get_user(r['user_id'])
+        desc += f"**{i}. {user_obj}** - {r['total']} ARC\n"
     embed = discord.Embed(title="Worldwide Leaderboard", description=desc)
     await interaction.followup.send(embed=embed)
 
@@ -296,6 +334,7 @@ async def main():
     global db_pool
     db_pool = await get_db_pool()
     await create_tables()
+    logger.info("Tables ready. Starting bot...")
     await bot.start(TOKEN)
 
 if __name__ == "__main__":
