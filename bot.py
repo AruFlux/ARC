@@ -29,6 +29,45 @@ async def create_user(user_id):
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", user_id)
 
+# --- Database Initialization ---
+async def setup_database():
+    async with db_pool.acquire() as conn:
+        # Users table
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            wallet BIGINT DEFAULT 1000,
+            bank BIGINT DEFAULT 0,
+            last_daily BIGINT DEFAULT 0
+        )
+        """)
+        # Stocks table
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS stocks (
+            symbol TEXT PRIMARY KEY,
+            price BIGINT DEFAULT 100
+        )
+        """)
+        # User stocks table
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_stocks (
+            user_id BIGINT,
+            symbol TEXT,
+            amount BIGINT DEFAULT 0,
+            PRIMARY KEY(user_id, symbol),
+            FOREIGN KEY(user_id) REFERENCES users(user_id),
+            FOREIGN KEY(symbol) REFERENCES stocks(symbol)
+        )
+        """)
+        # Insert default stocks if empty
+        await conn.execute("""
+        INSERT INTO stocks(symbol, price) VALUES
+        ('ARC', 100),
+        ('BTC', 500),
+        ('ETH', 300)
+        ON CONFLICT(symbol) DO NOTHING
+        """)
+
 # --- Stock updater ---
 async def update_stocks():
     await bot.wait_until_ready()
@@ -49,12 +88,10 @@ class MyBot(discord.Client):
         self.token = TOKEN
 
     async def setup_hook(self):
-        # Database connection
         global db_pool
         db_pool = await get_db_pool()
-        # schedule stock updater
+        await setup_database()          # <--- create tables automatically
         self.loop.create_task(update_stocks())
-        # sync commands globally
         await self.tree.sync()
 
 bot = MyBot(intents=intents)
@@ -178,3 +215,7 @@ async def addarc(interaction: discord.Interaction, user: discord.Member, amount:
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET wallet=wallet+$1 WHERE user_id=$2", amount, user.id)
     await interaction.response.send_message(f"Added {amount} ARC to {user.name}.", ephemeral=True)
+
+# --- Run Bot ---
+if __name__ == "__main__":
+    bot.run(TOKEN)
