@@ -20,7 +20,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 TOKEN = os.environ.get("DISCORD_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-ADMIN_ID = 123456789012345678  # replace with your Discord ID
+ADMIN_ID = 783542452756938813  # replace with your Discord ID
 
 db_pool: asyncpg.pool.Pool = None
 
