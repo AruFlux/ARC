@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Your specific server ID for logging
-LOG_SERVER_ID = 1463101887871062153
+LOG_SERVER_ID = 1463101887141249107
 LOG_CHANNEL_ID = 1463101887871062153
 
 class BypassMethod(Enum):
