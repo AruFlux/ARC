@@ -9,12 +9,12 @@ import random
 import os
 import re
 import asyncio
+import sqlite3
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, Tuple, Dict, List, Any
 from datetime import datetime, timedelta
 import aiohttp
 import logging
-import asyncpg
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Your specific server ID for logging
 LOG_SERVER_ID = 1463101887871062153
-LOG_CHANNEL_ID = 1463101887871062153  # Same as server, you can change this
+LOG_CHANNEL_ID = 1463101887871062153
 
 class BypassMethod(Enum):
     DYNAMIC_DECODE = "dynamic_decode"
@@ -59,8 +59,8 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         
         super().__init__(command_prefix='!', intents=intents)
         
-        # Database connection
-        self.db_pool: Optional[asyncpg.Pool] = None
+        # SQLite database connection
+        self.db_conn: Optional[sqlite3.Connection] = None
         
         # Rate limiting and statistics
         self.request_count: Dict[int, List[float]] = {}
@@ -118,97 +118,85 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         self.stats_task = asyncio.create_task(self.periodic_stats_log())
         
     async def init_database(self):
-        """Initialize PostgreSQL database connection and tables"""
+        """Initialize SQLite database and tables"""
         try:
-            # Get database URL from environment variables
-            database_url = os.getenv('DATABASE_URL')
-            
-            if not database_url:
-                logger.warning("DATABASE_URL not set. Database logging disabled.")
-                return
-            
-            # Create connection pool
-            self.db_pool = await asyncpg.create_pool(
-                dsn=database_url,
-                min_size=1,
-                max_size=10,
-                command_timeout=60
-            )
+            # Create database connection
+            self.db_conn = sqlite3.connect('linkvertise_bot.db', check_same_thread=False)
+            self.db_conn.row_factory = sqlite3.Row
+            cursor = self.db_conn.cursor()
             
             # Create tables
-            async with self.db_pool.acquire() as conn:
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS bypass_logs (
-                        id SERIAL PRIMARY KEY,
-                        timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
-                        user_id BIGINT NOT NULL,
-                        username TEXT NOT NULL,
-                        guild_id BIGINT,
-                        guild_name TEXT,
-                        original_url TEXT NOT NULL,
-                        bypassed_url TEXT,
-                        success BOOLEAN NOT NULL,
-                        method TEXT NOT NULL,
-                        execution_time FLOAT NOT NULL,
-                        message TEXT NOT NULL,
-                        ip_address INET,
-                        user_agent TEXT
-                    )
-                ''')
-                
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS user_stats (
-                        user_id BIGINT PRIMARY KEY,
-                        username TEXT NOT NULL,
-                        total_requests INTEGER DEFAULT 0,
-                        successful_requests INTEGER DEFAULT 0,
-                        failed_requests INTEGER DEFAULT 0,
-                        first_seen TIMESTAMP DEFAULT NOW(),
-                        last_seen TIMESTAMP DEFAULT NOW()
-                    )
-                ''')
-                
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS server_stats (
-                        guild_id BIGINT PRIMARY KEY,
-                        guild_name TEXT NOT NULL,
-                        total_requests INTEGER DEFAULT 0,
-                        unique_users INTEGER DEFAULT 0,
-                        first_seen TIMESTAMP DEFAULT NOW(),
-                        last_seen TIMESTAMP DEFAULT NOW()
-                    )
-                ''')
-                
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS daily_stats (
-                        date DATE PRIMARY KEY,
-                        total_requests INTEGER DEFAULT 0,
-                        successful_requests INTEGER DEFAULT 0,
-                        unique_users INTEGER DEFAULT 0,
-                        unique_servers INTEGER DEFAULT 0
-                    )
-                ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bypass_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    user_id BIGINT NOT NULL,
+                    username TEXT NOT NULL,
+                    guild_id BIGINT,
+                    guild_name TEXT,
+                    original_url TEXT NOT NULL,
+                    bypassed_url TEXT,
+                    success BOOLEAN NOT NULL,
+                    method TEXT NOT NULL,
+                    execution_time FLOAT NOT NULL,
+                    message TEXT NOT NULL
+                )
+            ''')
             
-            logger.info("Database initialized successfully")
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_stats (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    total_requests INTEGER DEFAULT 0,
+                    successful_requests INTEGER DEFAULT 0,
+                    failed_requests INTEGER DEFAULT 0,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS server_stats (
+                    guild_id BIGINT PRIMARY KEY,
+                    guild_name TEXT NOT NULL,
+                    total_requests INTEGER DEFAULT 0,
+                    unique_users INTEGER DEFAULT 0,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_stats (
+                    date DATE PRIMARY KEY,
+                    total_requests INTEGER DEFAULT 0,
+                    successful_requests INTEGER DEFAULT 0,
+                    unique_users INTEGER DEFAULT 0,
+                    unique_servers INTEGER DEFAULT 0
+                )
+            ''')
+            
+            self.db_conn.commit()
+            logger.info("SQLite database initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
-            self.db_pool = None
+            self.db_conn = None
     
     async def log_to_database(self, result: BypassResult, user: discord.User, guild: Optional[discord.Guild] = None):
-        """Log bypass attempt to database"""
-        if not self.db_pool:
+        """Log bypass attempt to SQLite database"""
+        if not self.db_conn:
             return
             
         try:
-            async with self.db_pool.acquire() as conn:
-                # Log bypass attempt
-                await conn.execute('''
-                    INSERT INTO bypass_logs 
-                    (user_id, username, guild_id, guild_name, original_url, bypassed_url, 
-                     success, method, execution_time, message)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ''',
+            cursor = self.db_conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO bypass_logs 
+                (user_id, username, guild_id, guild_name, original_url, bypassed_url, 
+                 success, method, execution_time, message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
                 user.id,
                 str(user),
                 guild.id if guild else None,
@@ -219,91 +207,94 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 result.method.value,
                 result.execution_time,
                 result.message
-                )
-                
-                # Update user stats
-                await conn.execute('''
-                    INSERT INTO user_stats (user_id, username, total_requests, successful_requests, failed_requests)
-                    VALUES ($1, $2, 1, $3, $4)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    total_requests = user_stats.total_requests + 1,
-                    successful_requests = user_stats.successful_requests + $3,
-                    failed_requests = user_stats.failed_requests + $4,
-                    last_seen = NOW()
-                ''',
+            ))
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO user_stats 
+                (user_id, username, total_requests, successful_requests, failed_requests, last_seen)
+                VALUES (?, ?, 
+                    COALESCE((SELECT total_requests FROM user_stats WHERE user_id = ?), 0) + 1,
+                    COALESCE((SELECT successful_requests FROM user_stats WHERE user_id = ?), 0) + ?,
+                    COALESCE((SELECT failed_requests FROM user_stats WHERE user_id = ?), 0) + ?,
+                    CURRENT_TIMESTAMP)
+            ''', (
                 user.id,
                 str(user),
+                user.id,
+                user.id,
                 1 if result.success else 0,
+                user.id,
                 0 if result.success else 1
-                )
-                
-                # Update server stats if in a guild
-                if guild:
-                    await conn.execute('''
-                        INSERT INTO server_stats (guild_id, guild_name, total_requests, unique_users)
-                        VALUES ($1, $2, 1, 1)
-                        ON CONFLICT (guild_id) DO UPDATE SET
-                        guild_name = EXCLUDED.guild_name,
-                        total_requests = server_stats.total_requests + 1,
-                        last_seen = NOW()
-                    ''',
+            ))
+            
+            if guild:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO server_stats 
+                    (guild_id, guild_name, total_requests, last_seen)
+                    VALUES (?, ?, 
+                        COALESCE((SELECT total_requests FROM server_stats WHERE guild_id = ?), 0) + 1,
+                        CURRENT_TIMESTAMP)
+                ''', (
                     guild.id,
-                    guild.name
-                    )
-                    
-                    # Count unique users for this server
-                    unique_count = await conn.fetchval('''
-                        SELECT COUNT(DISTINCT user_id) 
-                        FROM bypass_logs 
-                        WHERE guild_id = $1
-                    ''', guild.id)
-                    
-                    await conn.execute('''
-                        UPDATE server_stats 
-                        SET unique_users = $1 
-                        WHERE guild_id = $2
-                    ''', unique_count, guild.id)
+                    guild.name,
+                    guild.id
+                ))
                 
-                # Update daily stats
-                today = datetime.now().date()
-                await conn.execute('''
-                    INSERT INTO daily_stats (date, total_requests, successful_requests)
-                    VALUES ($1, 1, $2)
-                    ON CONFLICT (date) DO UPDATE SET
-                    total_requests = daily_stats.total_requests + 1,
-                    successful_requests = daily_stats.successful_requests + $2
-                ''',
-                today,
-                1 if result.success else 0
-                )
-                
-                # Update unique users count for today
-                unique_users_today = await conn.fetchval('''
+                cursor.execute('''
                     SELECT COUNT(DISTINCT user_id) 
                     FROM bypass_logs 
-                    WHERE DATE(timestamp) = $1
-                ''', today)
+                    WHERE guild_id = ?
+                ''', (guild.id,))
+                unique_count = cursor.fetchone()[0]
                 
-                unique_servers_today = await conn.fetchval('''
-                    SELECT COUNT(DISTINCT guild_id) 
-                    FROM bypass_logs 
-                    WHERE DATE(timestamp) = $1 AND guild_id IS NOT NULL
-                ''', today)
-                
-                await conn.execute('''
-                    UPDATE daily_stats 
-                    SET unique_users = $1, unique_servers = $2 
-                    WHERE date = $3
-                ''', unique_users_today, unique_servers_today, today)
-                
+                cursor.execute('''
+                    UPDATE server_stats 
+                    SET unique_users = ? 
+                    WHERE guild_id = ?
+                ''', (unique_count, guild.id))
+            
+            today = datetime.now().date().isoformat()
+            cursor.execute('''
+                INSERT OR REPLACE INTO daily_stats 
+                (date, total_requests, successful_requests)
+                VALUES (?, 
+                    COALESCE((SELECT total_requests FROM daily_stats WHERE date = ?), 0) + 1,
+                    COALESCE((SELECT successful_requests FROM daily_stats WHERE date = ?), 0) + ?)
+            ''', (
+                today,
+                today,
+                today,
+                1 if result.success else 0
+            ))
+            
+            cursor.execute('''
+                SELECT COUNT(DISTINCT user_id) 
+                FROM bypass_logs 
+                WHERE DATE(timestamp) = DATE('now')
+            ''')
+            unique_users_today = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(DISTINCT guild_id) 
+                FROM bypass_logs 
+                WHERE DATE(timestamp) = DATE('now') AND guild_id IS NOT NULL
+            ''')
+            unique_servers_today = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                UPDATE daily_stats 
+                SET unique_users = ?, unique_servers = ? 
+                WHERE date = ?
+            ''', (unique_users_today, unique_servers_today, today))
+            
+            self.db_conn.commit()
+            
         except Exception as e:
             logger.error(f"Failed to log to database: {e}")
     
     async def send_log_to_discord(self, result: BypassResult, user: discord.User, guild: Optional[discord.Guild] = None):
         """Send log to your private Discord channel"""
         if not self.log_channel:
-            # Try to get the log channel
             guild_obj = self.get_guild(LOG_SERVER_ID)
             if guild_obj:
                 self.log_channel = guild_obj.get_channel(LOG_CHANNEL_ID) or guild_obj.system_channel
@@ -339,8 +330,8 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         """Cleanup on shutdown"""
         if self.session:
             await self.session.close()
-        if self.db_pool:
-            await self.db_pool.close()
+        if self.db_conn:
+            self.db_conn.close()
         if hasattr(self, 'cleanup_task'):
             self.cleanup_task.cancel()
         if hasattr(self, 'stats_task'):
@@ -361,65 +352,67 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
     
     async def log_hourly_stats(self):
         """Log hourly statistics to Discord"""
-        if not self.db_pool or not self.log_channel:
+        if not self.db_conn or not self.log_channel:
             return
             
         try:
-            async with self.db_pool.acquire() as conn:
-                # Get hourly stats
-                hour_ago = datetime.now() - timedelta(hours=1)
-                
-                total_requests = await conn.fetchval('''
-                    SELECT COUNT(*) FROM bypass_logs 
-                    WHERE timestamp >= $1
-                ''', hour_ago)
-                
-                successful_requests = await conn.fetchval('''
-                    SELECT COUNT(*) FROM bypass_logs 
-                    WHERE timestamp >= $1 AND success = true
-                ''', hour_ago)
-                
-                unique_users = await conn.fetchval('''
-                    SELECT COUNT(DISTINCT user_id) FROM bypass_logs 
-                    WHERE timestamp >= $1
-                ''', hour_ago)
-                
-                unique_servers = await conn.fetchval('''
-                    SELECT COUNT(DISTINCT guild_id) FROM bypass_logs 
-                    WHERE timestamp >= $1 AND guild_id IS NOT NULL
-                ''', hour_ago)
-                
-                # Get top 5 users in last hour
-                top_users = await conn.fetch('''
-                    SELECT username, COUNT(*) as request_count 
-                    FROM bypass_logs 
-                    WHERE timestamp >= $1 
-                    GROUP BY username 
-                    ORDER BY request_count DESC 
-                    LIMIT 5
-                ''', hour_ago)
-                
-                # Create embed
-                embed = discord.Embed(
-                    title="📊 Hourly Statistics",
-                    color=0x7289DA,
-                    timestamp=datetime.utcnow()
-                )
-                
-                embed.add_field(name="Total Requests", value=str(total_requests), inline=True)
-                embed.add_field(name="Successful", value=str(successful_requests), inline=True)
-                embed.add_field(name="Success Rate", value=f"{(successful_requests/total_requests*100):.1f}%" if total_requests > 0 else "0%", inline=True)
-                
-                embed.add_field(name="Unique Users", value=str(unique_users), inline=True)
-                embed.add_field(name="Unique Servers", value=str(unique_servers), inline=True)
-                
-                # Add top users
-                if top_users:
-                    top_users_text = "\n".join([f"{row['username']}: {row['request_count']}" for row in top_users])
-                    embed.add_field(name="Top Users (Last Hour)", value=f"```{top_users_text}```", inline=False)
-                
-                await self.log_channel.send(embed=embed)
-                
+            cursor = self.db_conn.cursor()
+            
+            hour_ago = (datetime.now() - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM bypass_logs 
+                WHERE timestamp >= ?
+            ''', (hour_ago,))
+            total_requests = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM bypass_logs 
+                WHERE timestamp >= ? AND success = 1
+            ''', (hour_ago,))
+            successful_requests = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(DISTINCT user_id) FROM bypass_logs 
+                WHERE timestamp >= ?
+            ''', (hour_ago,))
+            unique_users = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(DISTINCT guild_id) FROM bypass_logs 
+                WHERE timestamp >= ? AND guild_id IS NOT NULL
+            ''', (hour_ago,))
+            unique_servers = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT username, COUNT(*) as request_count 
+                FROM bypass_logs 
+                WHERE timestamp >= ? 
+                GROUP BY username 
+                ORDER BY request_count DESC 
+                LIMIT 5
+            ''', (hour_ago,))
+            top_users = cursor.fetchall()
+            
+            embed = discord.Embed(
+                title="📊 Hourly Statistics",
+                color=0x7289DA,
+                timestamp=datetime.utcnow()
+            )
+            
+            embed.add_field(name="Total Requests", value=str(total_requests), inline=True)
+            embed.add_field(name="Successful", value=str(successful_requests), inline=True)
+            embed.add_field(name="Success Rate", value=f"{(successful_requests/total_requests*100):.1f}%" if total_requests > 0 else "0%", inline=True)
+            
+            embed.add_field(name="Unique Users", value=str(unique_users), inline=True)
+            embed.add_field(name="Unique Servers", value=str(unique_servers), inline=True)
+            
+            if top_users:
+                top_users_text = "\n".join([f"{row['username']}: {row['request_count']}" for row in top_users])
+                embed.add_field(name="Top Users (Last Hour)", value=f"```{top_users_text}```", inline=False)
+            
+            await self.log_channel.send(embed=embed)
+            
         except Exception as e:
             logger.error(f"Failed to log hourly stats: {e}")
     
@@ -451,7 +444,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         
         logger.info(f"Bot started with {len(self.guilds)} guilds")
         
-        # Send startup notification to log channel
         await self.send_startup_notification()
     
     async def send_startup_notification(self):
@@ -469,7 +461,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 timestamp=datetime.utcnow()
             )
             embed.add_field(name="Bot User", value=f"{self.user} ({self.user.id})", inline=True)
-            embed.add_field(name="Database", value="✅ Connected" if self.db_pool else "❌ Disabled", inline=True)
+            embed.add_field(name="Database", value="✅ Connected" if self.db_conn else "❌ Disabled", inline=True)
             await self.log_channel.send(embed=embed)
     
     def get_cache_key(self, url: str) -> str:
@@ -812,11 +804,9 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             if not result.success:
                 result = await self.bypass_fallback(url)
         
-        # Add user and guild info to result
         result.user_id = user_id
         result.guild_id = guild_id
         
-        # Update user stats
         if user_id in self.user_stats:
             if result.success:
                 self.user_stats[user_id]['successful_bypasses'] += 1
@@ -824,6 +814,10 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 self.user_stats[user_id]['failed_bypasses'] += 1
         
         return result
+    
+    def extract_linkvertise_urls(self, text: str) -> List[str]:
+        pattern = r'https?://[^\s]*linkvertise[^\s]*'
+        return re.findall(pattern, text, re.IGNORECASE)
 
 bot = EnhancedLinkvertiseBypassBot()
 
@@ -832,6 +826,16 @@ bot = EnhancedLinkvertiseBypassBot()
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: (i.guild_id, i.user.id) if i.guild_id else i.user.id)
 async def bypass_command(interaction: discord.Interaction, url: str):
     await interaction.response.defer(thinking=True)
+    
+    # BLOCK DM USAGE
+    if not interaction.guild:
+        embed = discord.Embed(
+            title="Command Not Available",
+            description="This command can only be used in servers, not in direct messages.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed)
+        return
     
     if not bot.is_valid_linkvertise_url(url):
         embed = discord.Embed(
@@ -858,14 +862,12 @@ async def bypass_command(interaction: discord.Interaction, url: str):
         await interaction.followup.send(embed=embed)
         return
     
-    # Process bypass
     result = await bot.bypass_linkvertise(
         url=url,
         user_id=interaction.user.id,
         guild_id=interaction.guild.id if interaction.guild else None
     )
     
-    # Log to database and Discord
     await bot.log_to_database(result, interaction.user, interaction.guild)
     await bot.send_log_to_discord(result, interaction.user, interaction.guild)
     
@@ -956,7 +958,319 @@ async def bypass_error(interaction: discord.Interaction, error):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Other commands (stats, batch, cache) remain the same...
+@bot.tree.command(name="stats", description="View your bypass statistics")
+async def stats_command(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    
+    if user_id in bot.user_stats:
+        stats = bot.user_stats[user_id]
+        success_rate = (stats['successful_bypasses'] / max(stats['total_requests'], 1)) * 100
+        
+        embed = discord.Embed(
+            title="Your Bypass Statistics",
+            color=0x7289DA,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="Total Requests",
+            value=f"{stats['total_requests']}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Successful",
+            value=f"{stats['successful_bypasses']}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Failed",
+            value=f"{stats['failed_bypasses']}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Success Rate",
+            value=f"{success_rate:.1f}%",
+            inline=True
+        )
+        
+        daily_used = stats.get('daily_requests', 0)
+        daily_remaining = bot.DAILY_LIMIT - daily_used
+        reset_time = stats.get('reset_time', time.time())
+        
+        embed.add_field(
+            name="Daily Usage",
+            value=f"{daily_used}/{bot.DAILY_LIMIT}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Daily Remaining",
+            value=f"{max(0, daily_remaining)}",
+            inline=True
+        )
+        
+        now = time.time()
+        user_requests = bot.request_count.get(user_id, [])
+        recent_requests = [req for req in user_requests if now - req < bot.RATE_LIMIT_WINDOW]
+        remaining = bot.MAX_REQUESTS_PER_WINDOW - len(recent_requests)
+        
+        embed.add_field(
+            name="Current Minute",
+            value=f"{len(recent_requests)}/{bot.MAX_REQUESTS_PER_WINDOW}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Remaining Requests",
+            value=str(remaining),
+            inline=True
+        )
+        
+        last_request = stats.get('last_request', 0)
+        if last_request:
+            last_time = datetime.fromtimestamp(last_request)
+            embed.add_field(
+                name="Last Request",
+                value=f"<t:{int(last_request)}:R>",
+                inline=True
+            )
+        
+        embed.set_footer(text=f"Statistics for {interaction.user.name}")
+        
+    else:
+        embed = discord.Embed(
+            title="Your Statistics",
+            description="You haven't made any bypass requests yet.",
+            color=0x7289DA
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="batch", description="Bypass multiple links at once")
+@app_commands.describe(
+    links="Links separated by commas (e.g., link1, link2, link3)"
+)
+@app_commands.checks.cooldown(1, 30.0, key=lambda i: (i.guild_id, i.user.id) if i.guild_id else i.user.id)
+async def batch_command(interaction: discord.Interaction, links: str):
+    await interaction.response.defer(thinking=True)
+    
+    # BLOCK DM USAGE
+    if not interaction.guild:
+        embed = discord.Embed(
+            title="Command Not Available",
+            description="This command can only be used in servers, not in direct messages.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
+    # Split links by commas and clean up whitespace
+    url_list = []
+    for link in links.split(','):
+        link = link.strip()
+        if link and bot.is_valid_linkvertise_url(link):
+            url_list.append(link)
+    
+    # Also extract any missed URLs using regex
+    extracted_urls = bot.extract_linkvertise_urls(links)
+    for url in extracted_urls:
+        if url not in url_list and bot.is_valid_linkvertise_url(url):
+            url_list.append(url)
+    
+    if not url_list:
+        embed = discord.Embed(
+            title="No Valid URLs",
+            description="No valid Linkvertise URLs found in your input.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
+    if len(url_list) > 10:
+        url_list = url_list[:10]
+        warning = "Limited to first 10 URLs"
+    else:
+        warning = None
+    
+    results = []
+    successful = 0
+    successful_urls = []
+    failed_urls = []
+    
+    for url in url_list:
+        result = await bot.bypass_linkvertise(url, interaction.user.id, interaction.guild.id)
+        results.append((url, result.success, result.message, result.url))
+        if result.success:
+            successful += 1
+            successful_urls.append(result.url)
+        else:
+            failed_urls.append(url)
+    
+    color = 0x00FF00 if successful > 0 else 0xFFA500
+    
+    embed = discord.Embed(
+        title="Batch Bypass Results",
+        color=color,
+        timestamp=datetime.utcnow()
+    )
+    
+    embed.add_field(
+        name="Summary",
+        value=f"{successful}/{len(results)} successful bypasses",
+        inline=False
+    )
+    
+    if successful_urls:
+        display_list = []
+        for i, (original_url, success, _, direct_url) in enumerate(results):
+            if success and i < 3:
+                display_list.append(f"• {original_url[:60]}...")
+        display = "\n".join(display_list)
+        
+        if len(successful_urls) > 3:
+            display += f"\n• ... and {len(successful_urls) - 3} more"
+        
+        embed.add_field(
+            name="Successful Bypasses",
+            value=display,
+            inline=False
+        )
+    
+    if failed_urls:
+        display_list = []
+        for url in failed_urls[:3]:
+            display_list.append(f"• {url[:60]}...")
+        display = "\n".join(display_list)
+        
+        if len(failed_urls) > 3:
+            display += f"\n• ... and {len(failed_urls) - 3} more"
+        
+        embed.add_field(
+            name="Failed URLs",
+            value=display,
+            inline=False
+        )
+    
+    if warning:
+        embed.set_footer(text=warning)
+    
+    # Create view with buttons for direct links
+    if successful_urls:
+        view = discord.ui.View(timeout=180)
+        for i, direct_url in enumerate(successful_urls[:5]):
+            if i < len(url_list):
+                button_label = f"Direct Link {i+1}"
+            else:
+                button_label = f"Link {i+1}"
+            
+            button = discord.ui.Button(
+                label=button_label,
+                url=direct_url,
+                style=discord.ButtonStyle.link
+            )
+            view.add_item(button)
+        
+        await interaction.followup.send(embed=embed, view=view)
+    else:
+        await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="cache", description="View cache statistics")
+async def cache_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Cache Statistics",
+        color=0x7289DA,
+        timestamp=datetime.utcnow()
+    )
+    
+    embed.add_field(
+        name="Total Cached URLs",
+        value=f"{len(bot.cache)}",
+        inline=True
+    )
+    
+    now = time.time()
+    recent = 0
+    old = 0
+    
+    for _, timestamp, _ in bot.cache.values():
+        age = now - timestamp
+        if age < 3600:
+            recent += 1
+        else:
+            old += 1
+    
+    embed.add_field(
+        name="< 1 hour",
+        value=f"{recent}",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="> 1 hour",
+        value=f"{old}",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="Bypass Methods",
+        value=f"```{json.dumps(bot.method_stats, indent=2)}```",
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user or message.author.bot:
+        return
+    
+    # Auto-detect Linkvertise URLs in guild messages
+    if message.guild:
+        urls = bot.extract_linkvertise_urls(message.content)
+        
+        if urls:
+            urls = urls[:3]
+            
+            view = discord.ui.View(timeout=300)
+            
+            for i, url in enumerate(urls):
+                if len(url) > 50:
+                    label = f"Bypass Link {i+1}"
+                else:
+                    label = f"Bypass: {url[:30]}..."
+                
+                button = discord.ui.Button(
+                    label=label,
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"auto_bypass_{i}"
+                )
+                
+                async def button_callback(interaction: discord.Interaction, target_url=url):
+                    await bypass_command(interaction, target_url)
+                
+                button.callback = button_callback
+                view.add_item(button)
+            
+            if message.channel.permissions_for(message.guild.me).send_messages:
+                response = await message.reply(
+                    f"Detected {len(urls)} Linkvertise link(s). Click below to bypass:",
+                    view=view,
+                    mention_author=False
+                )
+                
+                async def cleanup():
+                    await asyncio.sleep(300)
+                    try:
+                        await response.delete()
+                    except:
+                        pass
+                
+                asyncio.create_task(cleanup())
+    
+    await bot.process_commands(message)
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
