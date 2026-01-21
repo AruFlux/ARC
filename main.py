@@ -98,6 +98,9 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         # Logging channel
         self.log_channel: Optional[discord.TextChannel] = None
         
+        # Last 24-hour stats timestamp
+        self.last_daily_stats_time: Optional[datetime] = None
+        
     async def setup_hook(self):
         """Setup database, session, and background tasks"""
         # Initialize database
@@ -243,7 +246,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 cursor.execute('''
                     SELECT COUNT(DISTINCT user_id) 
                     FROM bypass_logs 
-                    WHERE guild_id = ?
+                    WHERE guild_id = ? AND DATE(timestamp) = DATE('now')
                 ''', (guild.id,))
                 unique_count = cursor.fetchone()[0]
                 
@@ -311,7 +314,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
             embed.add_field(name="User", value=f"{user} ({user.id})", inline=True)
             embed.add_field(name="Server", value=f"{guild.name if guild else 'DM'} ({guild.id if guild else 'N/A'})", inline=True)
-            embed.add_field(name="Success", value="✅" if result.success else "❌", inline=True)
+            embed.add_field(name="Success", value="YES" if result.success else "NO", inline=True)
             
             embed.add_field(name="Original URL", value=f"```{result.original_url[:100]}...```", inline=False)
             
@@ -345,43 +348,55 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             self.cleanup_old_data()
             
     async def periodic_stats_log(self):
-        """Periodic logging of statistics to Discord"""
+        """Periodic logging of statistics to Discord - Only every 24 hours"""
+        # Wait for bot to be ready
+        await self.wait_until_ready()
+        # Wait 1 minute to ensure everything is loaded
+        await asyncio.sleep(60)
+        
         while True:
+            # Only log stats if 24 hours have passed since last log
+            now = datetime.utcnow()
+            if self.last_daily_stats_time is None or (now - self.last_daily_stats_time) >= timedelta(hours=24):
+                await self.log_24hour_stats()
+                self.last_daily_stats_time = now
+            
+            # Check every hour
             await asyncio.sleep(3600)
-            await self.log_hourly_stats()
     
-    async def log_hourly_stats(self):
-        """Log hourly statistics to Discord"""
+    async def log_24hour_stats(self):
+        """Log 24-hour statistics to Discord"""
         if not self.db_conn or not self.log_channel:
             return
             
         try:
             cursor = self.db_conn.cursor()
             
-            hour_ago = (datetime.now() - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+            # Get stats for the last 24 hours
+            twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
             
             cursor.execute('''
                 SELECT COUNT(*) FROM bypass_logs 
                 WHERE timestamp >= ?
-            ''', (hour_ago,))
+            ''', (twenty_four_hours_ago,))
             total_requests = cursor.fetchone()[0]
             
             cursor.execute('''
                 SELECT COUNT(*) FROM bypass_logs 
                 WHERE timestamp >= ? AND success = 1
-            ''', (hour_ago,))
+            ''', (twenty_four_hours_ago,))
             successful_requests = cursor.fetchone()[0]
             
             cursor.execute('''
                 SELECT COUNT(DISTINCT user_id) FROM bypass_logs 
                 WHERE timestamp >= ?
-            ''', (hour_ago,))
+            ''', (twenty_four_hours_ago,))
             unique_users = cursor.fetchone()[0]
             
             cursor.execute('''
                 SELECT COUNT(DISTINCT guild_id) FROM bypass_logs 
                 WHERE timestamp >= ? AND guild_id IS NOT NULL
-            ''', (hour_ago,))
+            ''', (twenty_four_hours_ago,))
             unique_servers = cursor.fetchone()[0]
             
             cursor.execute('''
@@ -391,30 +406,43 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 GROUP BY username 
                 ORDER BY request_count DESC 
                 LIMIT 5
-            ''', (hour_ago,))
+            ''', (twenty_four_hours_ago,))
             top_users = cursor.fetchall()
             
             embed = discord.Embed(
-                title="📊 Hourly Statistics",
+                title="24 Hour Statistics Report",
                 color=0x7289DA,
                 timestamp=datetime.utcnow()
             )
             
             embed.add_field(name="Total Requests", value=str(total_requests), inline=True)
-            embed.add_field(name="Successful", value=str(successful_requests), inline=True)
+            embed.add_field(name="Successful Requests", value=str(successful_requests), inline=True)
             embed.add_field(name="Success Rate", value=f"{(successful_requests/total_requests*100):.1f}%" if total_requests > 0 else "0%", inline=True)
             
             embed.add_field(name="Unique Users", value=str(unique_users), inline=True)
             embed.add_field(name="Unique Servers", value=str(unique_servers), inline=True)
             
+            # Method distribution
+            cursor.execute('''
+                SELECT method, COUNT(*) as count 
+                FROM bypass_logs 
+                WHERE timestamp >= ? 
+                GROUP BY method
+            ''', (twenty_four_hours_ago,))
+            method_counts = cursor.fetchall()
+            
+            if method_counts:
+                methods_text = "\n".join([f"{row['method']}: {row['count']}" for row in method_counts])
+                embed.add_field(name="Methods Used", value=f"```{methods_text}```", inline=False)
+            
             if top_users:
                 top_users_text = "\n".join([f"{row['username']}: {row['request_count']}" for row in top_users])
-                embed.add_field(name="Top Users (Last Hour)", value=f"```{top_users_text}```", inline=False)
+                embed.add_field(name="Top Users (24 Hours)", value=f"```{top_users_text}```", inline=False)
             
             await self.log_channel.send(embed=embed)
             
         except Exception as e:
-            logger.error(f"Failed to log hourly stats: {e}")
+            logger.error(f"Failed to log 24-hour stats: {e}")
     
     def cleanup_old_data(self):
         """Clean up old cache entries"""
@@ -455,13 +483,13 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         
         if self.log_channel:
             embed = discord.Embed(
-                title="🤖 Bot Started",
+                title="Bot Started",
                 description=f"Bot is now online in {len(self.guilds)} servers",
                 color=0x00FF00,
                 timestamp=datetime.utcnow()
             )
             embed.add_field(name="Bot User", value=f"{self.user} ({self.user.id})", inline=True)
-            embed.add_field(name="Database", value="✅ Connected" if self.db_conn else "❌ Disabled", inline=True)
+            embed.add_field(name="Database", value="Connected" if self.db_conn else "Disabled", inline=True)
             await self.log_channel.send(embed=embed)
     
     def get_cache_key(self, url: str) -> str:
@@ -559,15 +587,29 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         try:
             extracted = self.extract_dynamic_url(url)
             if extracted:
-                self.method_stats[BypassMethod.DYNAMIC_DECODE.value] += 1
-                return BypassResult(
-                    success=True,
-                    url=extracted,
-                    message="Dynamic link decoded successfully",
-                    method=BypassMethod.DYNAMIC_DECODE,
-                    execution_time=time.time() - start_time,
-                    original_url=url
-                )
+                # Try to follow any redirects to get final URL
+                try:
+                    async with self.session.head(extracted, allow_redirects=True) as response:
+                        final_url = str(response.url)
+                        self.method_stats[BypassMethod.DYNAMIC_DECODE.value] += 1
+                        return BypassResult(
+                            success=True,
+                            url=final_url,
+                            message="Dynamic link decoded and resolved successfully",
+                            method=BypassMethod.DYNAMIC_DECODE,
+                            execution_time=time.time() - start_time,
+                            original_url=url
+                        )
+                except:
+                    self.method_stats[BypassMethod.DYNAMIC_DECODE.value] += 1
+                    return BypassResult(
+                        success=True,
+                        url=extracted,
+                        message="Dynamic link decoded successfully",
+                        method=BypassMethod.DYNAMIC_DECODE,
+                        execution_time=time.time() - start_time,
+                        original_url=url
+                    )
             else:
                 return BypassResult(
                     success=False,
@@ -619,98 +661,134 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     original_url=url
                 )
             
-            random_num = random.randint(1000000, 9999999)
+            # Extract the numeric ID from the path
+            match = re.search(r'/(\d+)(?:/|$)', parsed.path)
+            if not match:
+                return BypassResult(
+                    success=False,
+                    url=None,
+                    message="Could not extract link ID from URL",
+                    method=BypassMethod.API_BYPASS,
+                    execution_time=time.time() - start_time,
+                    original_url=url
+                )
             
-            api_url = f"https://publisher.linkvertise.com/api/v1/redirect/link/static/{path}"
+            link_id = match.group(1)
+            
+            # Try to get target directly using the link ID
+            api_url = f"https://publisher.linkvertise.com/api/v1/redirect/link/{link_id}/target"
             
             try:
-                async with self.session.get(api_url) as response:
-                    if response.status != 200:
-                        return BypassResult(
-                            success=False,
-                            url=None,
-                            message=f"API error: HTTP {response.status}",
-                            method=BypassMethod.API_BYPASS,
-                            execution_time=time.time() - start_time,
-                            original_url=url
-                        )
-                    
-                    data = await response.json()
-                    
-            except asyncio.TimeoutError:
-                return BypassResult(
-                    success=False,
-                    url=None,
-                    message="API request timeout",
-                    method=BypassMethod.API_BYPASS,
-                    execution_time=time.time() - start_time,
-                    original_url=url
-                )
-            
-            if not data.get("success", False):
-                return BypassResult(
-                    success=False,
-                    url=None,
-                    message="Link not found or invalid",
-                    method=BypassMethod.API_BYPASS,
-                    execution_time=time.time() - start_time,
-                    original_url=url
-                )
-            
-            link_id = data.get("data", {}).get("link", {}).get("id")
-            if not link_id:
-                return BypassResult(
-                    success=False,
-                    url=None,
-                    message="Could not extract link ID",
-                    method=BypassMethod.API_BYPASS,
-                    execution_time=time.time() - start_time,
-                    original_url=url
-                )
-            
-            serial_data = {
-                "timestamp": int(time.time() * 1000),
-                "random": str(random_num),
-                "link_id": link_id
-            }
-            
-            serial_json = json.dumps(serial_data, separators=(',', ':'))
-            serial_base64 = base64.b64encode(serial_json.encode()).decode()
-            
-            target_url = f"https://publisher.linkvertise.com/api/v1/redirect/link/{path}/target?serial={serial_base64}"
-            
-            async with self.session.get(target_url) as response:
-                if response.status != 200:
-                    return BypassResult(
-                        success=False,
-                        url=None,
-                        message=f"Target API error: HTTP {response.status}",
-                        method=BypassMethod.API_BYPASS,
-                        execution_time=time.time() - start_time,
-                        original_url=url
-                    )
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json',
+                    'Referer': 'https://linkvertise.com/',
+                    'Origin': 'https://linkvertise.com'
+                }
                 
-                target_data = await response.json()
+                # Try with a serial parameter
+                random_num = random.randint(1000000, 9999999)
+                serial_data = {
+                    "timestamp": int(time.time() * 1000),
+                    "random": str(random_num),
+                    "link_id": link_id
+                }
+                serial_json = json.dumps(serial_data, separators=(',', ':'))
+                serial_base64 = base64.b64encode(serial_json.encode()).decode()
+                
+                target_url = f"{api_url}?serial={serial_base64}"
+                
+                async with self.session.get(target_url, headers=headers) as response:
+                    if response.status == 200:
+                        target_data = await response.json()
+                        if target_data.get("success", False):
+                            final_url = target_data.get("data", {}).get("target")
+                            if final_url:
+                                # Follow any redirects to get the actual final URL
+                                try:
+                                    async with self.session.head(final_url, allow_redirects=True, timeout=10) as redirect_response:
+                                        actual_final_url = str(redirect_response.url)
+                                        self.cache[cache_key] = (actual_final_url, time.time(), BypassMethod.API_BYPASS)
+                                        self.method_stats[BypassMethod.API_BYPASS.value] += 1
+                                        return BypassResult(
+                                            success=True,
+                                            url=actual_final_url,
+                                            message="API bypass successful - got final URL",
+                                            method=BypassMethod.API_BYPASS,
+                                            execution_time=time.time() - start_time,
+                                            original_url=url
+                                        )
+                                except:
+                                    self.cache[cache_key] = (final_url, time.time(), BypassMethod.API_BYPASS)
+                                    self.method_stats[BypassMethod.API_BYPASS.value] += 1
+                                    return BypassResult(
+                                        success=True,
+                                        url=final_url,
+                                        message="API bypass successful",
+                                        method=BypassMethod.API_BYPASS,
+                                        execution_time=time.time() - start_time,
+                                        original_url=url
+                                    )
             
-            if target_data.get("success", False):
-                final_url = target_data.get("data", {}).get("target")
-                if final_url:
-                    self.cache[cache_key] = (final_url, time.time(), BypassMethod.API_BYPASS)
-                    self.method_stats[BypassMethod.API_BYPASS.value] += 1
-                    
-                    return BypassResult(
-                        success=True,
-                        url=final_url,
-                        message="API bypass successful",
-                        method=BypassMethod.API_BYPASS,
-                        execution_time=time.time() - start_time,
-                        original_url=url
-                    )
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout for URL: {url}")
+            except Exception as e:
+                logger.warning(f"API call failed: {e}")
+            
+            # If direct API fails, try fallback method
+            # Extract path segments and try to get the actual content
+            path_parts = path.split('/')
+            if len(path_parts) > 1:
+                # Try to get the actual redirect URL from the page content
+                try:
+                    async with self.session.get(url, headers=headers, allow_redirects=True) as response:
+                        content = await response.text()
+                        
+                        # Look for common URL patterns in the page
+                        url_patterns = [
+                            r'window\.location\.href\s*=\s*["\']([^"\']+)["\']',
+                            r'content="0;\s*url=([^"]+)"',
+                            r'https?://[^\s<>"\']+\.(?:mega|mediafire|google|dropbox|drive)\.(?:com|nz|net)[^\s<>"\']*',
+                            r'https?://[^\s<>"\']+/file/[^\s<>"\']+',
+                            r'https?://[^\s<>"\']+/d/[^\s<>"\']+',
+                        ]
+                        
+                        for pattern in url_patterns:
+                            matches = re.findall(pattern, content, re.IGNORECASE)
+                            for match_url in matches:
+                                if match_url and 'linkvertise' not in match_url.lower():
+                                    # Follow any redirects
+                                    try:
+                                        async with self.session.head(match_url, allow_redirects=True, timeout=10) as redirect_response:
+                                            actual_final_url = str(redirect_response.url)
+                                            self.cache[cache_key] = (actual_final_url, time.time(), BypassMethod.API_BYPASS)
+                                            self.method_stats[BypassMethod.API_BYPASS.value] += 1
+                                            return BypassResult(
+                                                success=True,
+                                                url=actual_final_url,
+                                                message="Extracted URL from page content",
+                                                method=BypassMethod.API_BYPASS,
+                                                execution_time=time.time() - start_time,
+                                                original_url=url
+                                            )
+                                    except:
+                                        self.cache[cache_key] = (match_url, time.time(), BypassMethod.API_BYPASS)
+                                        self.method_stats[BypassMethod.API_BYPASS.value] += 1
+                                        return BypassResult(
+                                            success=True,
+                                            url=match_url,
+                                            message="Extracted URL from page content",
+                                            method=BypassMethod.API_BYPASS,
+                                            execution_time=time.time() - start_time,
+                                            original_url=url
+                                        )
+                except Exception as e:
+                    logger.warning(f"Page content extraction failed: {e}")
             
             return BypassResult(
                 success=False,
                 url=None,
-                message="Bypass failed - no target URL found",
+                message="Bypass failed - could not extract final URL",
                 method=BypassMethod.API_BYPASS,
                 execution_time=time.time() - start_time,
                 original_url=url
@@ -736,34 +814,64 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             try:
                 if service["method"] == "POST":
                     payload = {"url": url}
-                    async with self.session.post(service["url"], json=payload) as response:
+                    async with self.session.post(service["url"], json=payload, timeout=15) as response:
                         if response.status == 200:
                             data = await response.json()
                             if data.get("success") and data.get("destination"):
-                                self.method_stats[BypassMethod.FALLBACK_SERVICE.value] += 1
-                                return BypassResult(
-                                    success=True,
-                                    url=data["destination"],
-                                    message=f"Fallback successful via {service['url']}",
-                                    method=BypassMethod.FALLBACK_SERVICE,
-                                    execution_time=time.time() - start_time,
-                                    original_url=url
-                                )
+                                # Follow redirects to get final URL
+                                try:
+                                    final_url = data["destination"]
+                                    async with self.session.head(final_url, allow_redirects=True, timeout=10) as redirect_response:
+                                        actual_final_url = str(redirect_response.url)
+                                        self.method_stats[BypassMethod.FALLBACK_SERVICE.value] += 1
+                                        return BypassResult(
+                                            success=True,
+                                            url=actual_final_url,
+                                            message=f"Fallback successful via {service['url']}",
+                                            method=BypassMethod.FALLBACK_SERVICE,
+                                            execution_time=time.time() - start_time,
+                                            original_url=url
+                                        )
+                                except:
+                                    self.method_stats[BypassMethod.FALLBACK_SERVICE.value] += 1
+                                    return BypassResult(
+                                        success=True,
+                                        url=data["destination"],
+                                        message=f"Fallback successful via {service['url']}",
+                                        method=BypassMethod.FALLBACK_SERVICE,
+                                        execution_time=time.time() - start_time,
+                                        original_url=url
+                                    )
                 else:
                     params = {"url": url}
-                    async with self.session.get(service["url"], params=params) as response:
+                    async with self.session.get(service["url"], params=params, timeout=15) as response:
                         if response.status == 200:
                             data = await response.json()
                             if data.get("success") and data.get("destination"):
-                                self.method_stats[BypassMethod.FALLBACK_SERVICE.value] += 1
-                                return BypassResult(
-                                    success=True,
-                                    url=data["destination"],
-                                    message=f"Fallback successful via {service['url']}",
-                                    method=BypassMethod.FALLBACK_SERVICE,
-                                    execution_time=time.time() - start_time,
-                                    original_url=url
-                                )
+                                # Follow redirects to get final URL
+                                try:
+                                    final_url = data["destination"]
+                                    async with self.session.head(final_url, allow_redirects=True, timeout=10) as redirect_response:
+                                        actual_final_url = str(redirect_response.url)
+                                        self.method_stats[BypassMethod.FALLBACK_SERVICE.value] += 1
+                                        return BypassResult(
+                                            success=True,
+                                            url=actual_final_url,
+                                            message=f"Fallback successful via {service['url']}",
+                                            method=BypassMethod.FALLBACK_SERVICE,
+                                            execution_time=time.time() - start_time,
+                                            original_url=url
+                                        )
+                                except:
+                                    self.method_stats[BypassMethod.FALLBACK_SERVICE.value] += 1
+                                    return BypassResult(
+                                        success=True,
+                                        url=data["destination"],
+                                        message=f"Fallback successful via {service['url']}",
+                                        method=BypassMethod.FALLBACK_SERVICE,
+                                        execution_time=time.time() - start_time,
+                                        original_url=url
+                                    )
                                 
             except Exception as e:
                 logger.warning(f"Fallback service {service['url']} failed: {e}")
