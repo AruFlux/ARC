@@ -12,7 +12,7 @@ import asyncio
 import sqlite3
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, Tuple, Dict, List, Any, Set
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import aiohttp
 import logging
 from dataclasses import dataclass
@@ -30,17 +30,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Your specific server ID for logging
+# Server configuration
 LOG_SERVER_ID = 1463101887141249107
 LOG_CHANNEL_ID = 1463101887871062153
 
-# Auto-bypass channel constants
+# Auto-bypass configuration
 YOUR_USER_ID = 783542452756938813
 AUTO_BYPASS_CHANNEL_ID = 1464505405815259305
 AUTO_BYPASS_SERVER_ID = 1463101887141249107
 
-# Ping role ID
-PING_ROLE_ID = 1330639211317035089  # Game ping role ID
+# Notification configuration
+PING_ROLE_ID = 1330639211317035089
 
 class BypassMethod(Enum):
     DYNAMIC_DECODE = "dynamic_decode"
@@ -59,6 +59,7 @@ class BypassResult:
     original_url: str
     user_id: int = 0
     guild_id: Optional[int] = None
+    additional_info: Optional[Dict[str, Any]] = None
 
 class EnhancedLinkvertiseBypassBot(commands.Bot):
     def __init__(self):
@@ -69,10 +70,10 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         
         super().__init__(command_prefix='!', intents=intents)
         
-        # SQLite database connection
+        # Database connection
         self.db_conn: Optional[sqlite3.Connection] = None
         
-        # Rate limiting and statistics
+        # Rate limiting configuration
         self.request_count: Dict[int, List[float]] = {}
         self.RATE_LIMIT_WINDOW = 60
         self.MAX_REQUESTS_PER_WINDOW = 20
@@ -81,13 +82,13 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         # User statistics
         self.user_stats: Dict[int, Dict] = {}
         
-        # Cache with LRU support
+        # Cache management
         self.cache: Dict[str, Tuple[str, float, BypassMethod]] = {}
         self.cache_order: List[str] = []
         self.MAX_CACHE_SIZE = 1000
         self.CACHE_TTL = 7200
         
-        # Fallback services with improved list
+        # Service endpoints
         self.fallback_services = [
             {"url": "https://api.bypass.vip/bypass2", "method": "POST", "priority": 1, "timeout": 15},
             {"url": "https://bypass.pm/bypass2", "method": "GET", "priority": 2, "timeout": 15},
@@ -96,7 +97,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             {"url": "https://api.bypassfor.me/bypass", "method": "GET", "priority": 5, "timeout": 15},
         ]
         
-        # Linkvertise domains - expanded list
+        # Linkvertise domains
         self.linkvertise_domains = [
             "linkvertise.com",
             "linkvertise.net",
@@ -111,28 +112,24 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             "linkvertise.xyz",
         ]
         
-        # Session management
+        # Session and state management
         self.session: Optional[aiohttp.ClientSession] = None
         self.method_stats = {method.value: 0 for method in BypassMethod}
         self.blocked_urls = set()
         
-        # Logging channel
+        # Channel references
         self.log_channel: Optional[discord.TextChannel] = None
-        
-        # Auto-bypass system
         self.auto_bypass_channel: Optional[discord.TextChannel] = None
         self.auto_bypass_allowed_users: Set[int] = {YOUR_USER_ID}
-        
-        # Ping role
         self.ping_role: Optional[discord.Role] = None
         
-        # Last 24-hour stats timestamp
+        # Statistics tracking
         self.last_daily_stats_time: Optional[datetime] = None
         
-        # Thread pool for blocking operations
+        # Thread pool for background operations
         self.thread_pool = ThreadPoolExecutor(max_workers=4)
         
-        # Performance tracking
+        # Performance metrics
         self.performance_stats = {
             "total_requests": 0,
             "successful_requests": 0,
@@ -141,15 +138,13 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         }
         
     async def setup_hook(self):
-        """Setup database, session, and background tasks"""
-        # Initialize database
+        """Initialize database, session, and background tasks"""
         await self.init_database()
         
-        # Initialize HTTP session
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Accept": "application/json, text/html, application/xhtml+xml, */*",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
@@ -163,21 +158,95 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             }
         )
         
-        # Load authorized users from database
         await self.load_authorized_users()
-        
-        # Load cache from database
         await self.load_cache_from_database()
         
-        # Start background tasks
         self.cleanup_task = asyncio.create_task(self.periodic_cleanup())
         self.stats_task = asyncio.create_task(self.periodic_stats_log())
         self.health_check_task = asyncio.create_task(self.health_check_services())
     
+    async def check_roblox_game_availability(self, roblox_url: str) -> Tuple[bool, str, Optional[int]]:
+        """Verify Roblox game link accessibility"""
+        try:
+            patterns = [
+                r'games/(\d+)',
+                r'Place\.ashx\?id=(\d+)',
+                r'GamePlaceId=(\d+)',
+            ]
+            
+            game_id = None
+            for pattern in patterns:
+                match = re.search(pattern, roblox_url)
+                if match:
+                    game_id = int(match.group(1))
+                    break
+            
+            if not game_id:
+                return False, "Invalid Roblox URL format", None
+            
+            api_endpoints = [
+                f"https://games.roblox.com/v1/games/multiget-place-details?placeIds={game_id}",
+                f"https://games.roblox.com/v1/games?placeIds={game_id}",
+            ]
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            
+            for endpoint in api_endpoints:
+                try:
+                    async with self.session.get(endpoint, headers=headers, timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            
+                            if isinstance(data, list) and len(data) > 0:
+                                game_data = data[0]
+                                if "error" in game_data or game_data.get("isArchived", False):
+                                    return False, "Game has been archived or removed", game_id
+                                return True, "Game is accessible", game_id
+                            elif isinstance(data, dict):
+                                if "errors" in data or data.get("archived", False):
+                                    return False, "Game is not available", game_id
+                                return True, "Game is accessible", game_id
+                        elif response.status == 404:
+                            return False, "Game not found", game_id
+                        elif response.status == 403:
+                            return False, "Game access is restricted", game_id
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    continue
+            
+            try:
+                async with self.session.head(
+                    f"https://www.roblox.com/games/{game_id}/",
+                    allow_redirects=True,
+                    timeout=10
+                ) as response:
+                    if response.status == 404:
+                        return False, "Game page not found", game_id
+                    elif response.status == 403:
+                        return False, "Access denied to game page", game_id
+                    elif response.status in [200, 302, 301]:
+                        final_url = str(response.url)
+                        if "error" in final_url.lower() or "notfound" in final_url.lower():
+                            return False, "Game may be unavailable", game_id
+                        return True, "Game page is accessible", game_id
+            except Exception:
+                pass
+            
+            return True, "Unable to verify availability", game_id
+            
+        except Exception as e:
+            logger.error(f"Roblox game verification error: {e}")
+            return False, f"Verification error: {str(e)[:50]}", None
+    
     async def health_check_services(self):
-        """Periodic health check of bypass services"""
+        """Monitor service availability"""
         while True:
-            await asyncio.sleep(600)  # Check every 10 minutes
+            await asyncio.sleep(600)
             try:
                 active_services = []
                 for service in self.fallback_services:
@@ -193,9 +262,8 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     except:
                         continue
                 
-                logger.info(f"Health check: {len(active_services)}/{len(self.fallback_services)} services active")
+                logger.info(f"Service health check: {len(active_services)}/{len(self.fallback_services)} services operational")
                 
-                # Reorder services based on health
                 for i, service in enumerate(self.fallback_services):
                     if service["url"] in active_services:
                         service["priority"] = i + 1
@@ -205,10 +273,10 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 self.fallback_services.sort(key=lambda x: x["priority"])
                 
             except Exception as e:
-                logger.error(f"Health check failed: {e}")
+                logger.error(f"Health check operation failed: {e}")
     
     async def load_cache_from_database(self):
-        """Load cache from database on startup"""
+        """Restore cache from database storage"""
         if not self.db_conn:
             return
             
@@ -238,12 +306,12 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             logger.error(f"Failed to load cache from database: {e}")
     
     async def save_to_cache_database(self, cache_key: str, original_url: str, bypassed_url: str, method: BypassMethod):
-        """Save cache entry to database"""
+        """Persist cache entry to database"""
         if not self.db_conn:
             return
             
         try:
-            expires_at = (datetime.now() + timedelta(seconds=self.CACHE_TTL)).strftime('%Y-%m-%d %H:%M:%S')
+            expires_at = (datetime.now(UTC) + timedelta(seconds=self.CACHE_TTL)).strftime('%Y-%m-%d %H:%M:%S')
             
             cursor = self.db_conn.cursor()
             cursor.execute('''
@@ -277,13 +345,11 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             logger.error(f"Failed to load authorized users: {e}")
     
     async def init_database(self):
-        """Initialize SQLite database and tables"""
+        """Initialize database schema and connections"""
         try:
-            # Create database connection
             self.db_conn = sqlite3.connect('linkvertise_bot.db', check_same_thread=False)
             self.db_conn.row_factory = sqlite3.Row
             
-            # Enable optimizations
             self.db_conn.execute('PRAGMA journal_mode = WAL')
             self.db_conn.execute('PRAGMA synchronous = NORMAL')
             self.db_conn.execute('PRAGMA cache_size = -2000')
@@ -291,7 +357,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
             cursor = self.db_conn.cursor()
             
-            # Create tables
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS bypass_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -309,7 +374,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 )
             ''')
             
-            # Create indexes
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_user ON bypass_logs(user_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_guild ON bypass_logs(guild_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON bypass_logs(timestamp)')
@@ -372,21 +436,20 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 )
             ''')
             
-            # Insert your user ID if not exists
             cursor.execute('''
                 INSERT OR IGNORE INTO authorized_users (user_id, added_by, can_auto_bypass, can_use_batch)
                 VALUES (?, ?, 1, 1)
             ''', (YOUR_USER_ID, YOUR_USER_ID))
             
             self.db_conn.commit()
-            logger.info("SQLite database initialized successfully")
+            logger.info("Database initialization completed")
             
         except Exception as e:
-            logger.error(f"Failed to initialize database: {e}")
+            logger.error(f"Database initialization failed: {e}")
             self.db_conn = None
     
     async def log_to_database(self, result: BypassResult, user: discord.User, guild: Optional[discord.Guild] = None):
-        """Log bypass attempt to SQLite database"""
+        """Record bypass operation to database"""
         if not self.db_conn:
             return
             
@@ -403,7 +466,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 user.id,
                 str(user),
                 guild.id if guild else None,
-                guild.name if guild else 'DM',
+                guild.name if guild else 'Direct Message',
                 result.original_url,
                 result.url,
                 result.success,
@@ -453,7 +516,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     WHERE guild_id = ?
                 ''', (guild.id, guild.id))
             
-            today = datetime.now().date().isoformat()
+            today = datetime.now(UTC).date().isoformat()
             cursor.execute('''
                 INSERT OR REPLACE INTO daily_stats 
                 (date, total_requests, successful_requests, unique_users, unique_servers)
@@ -488,7 +551,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
             self.db_conn.commit()
             
-            # Update performance stats
             self.performance_stats["total_requests"] += 1
             if result.success:
                 self.performance_stats["successful_requests"] += 1
@@ -503,12 +565,12 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             )
             
         except Exception as e:
-            logger.error(f"Failed to log to database: {e}")
+            logger.error(f"Database logging failed: {e}")
             if self.db_conn:
                 self.db_conn.rollback()
     
     async def send_log_to_discord(self, result: BypassResult, user: discord.User, guild: Optional[discord.Guild] = None):
-        """Send log to your private Discord channel"""
+        """Send operation log to monitoring channel"""
         if not self.log_channel:
             guild_obj = self.get_guild(LOG_SERVER_ID)
             if guild_obj:
@@ -524,14 +586,14 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 return url[:max_len-3] + "..."
             
             embed = discord.Embed(
-                title="Bypass Log",
+                title="Bypass Operation Log",
                 color=0x00FF00 if result.success else 0xFF0000,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC)
             )
             
             embed.add_field(name="User", value=f"{user} ({user.id})", inline=True)
-            embed.add_field(name="Server", value=f"{guild.name if guild else 'DM'} ({guild.id if guild else 'N/A'})", inline=True)
-            embed.add_field(name="Success", value="YES" if result.success else "NO", inline=True)
+            embed.add_field(name="Server", value=f"{guild.name if guild else 'Direct Message'} ({guild.id if guild else 'N/A'})", inline=True)
+            embed.add_field(name="Status", value="Successful" if result.success else "Failed", inline=True)
             
             embed.add_field(name="Original URL", value=f"```{truncate_url(result.original_url)}```", inline=False)
             
@@ -539,12 +601,12 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 embed.add_field(name="Bypassed URL", value=f"```{truncate_url(result.url)}```", inline=False)
             
             embed.add_field(name="Method", value=result.method.value.replace('_', ' ').title(), inline=True)
-            embed.add_field(name="Time", value=f"{result.execution_time:.2f}s", inline=True)
+            embed.add_field(name="Processing Time", value=f"{result.execution_time:.2f}s", inline=True)
             
             if self.performance_stats["total_requests"] > 0:
                 embed.add_field(
-                    name="Performance",
-                    value=f"Success Rate: {self.performance_stats['success_rate']:.1f}%\nAvg Time: {self.performance_stats['avg_response_time']:.2f}s",
+                    name="Performance Metrics",
+                    value=f"Success Rate: {self.performance_stats['success_rate']:.1f}%\nAverage Response Time: {self.performance_stats['avg_response_time']:.2f}s",
                     inline=True
                 )
             
@@ -553,11 +615,10 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to send log to Discord: {e}")
     
-    # Auto-bypass methods
     async def auto_bypass_to_channel(self, urls: List[str], user: discord.User, source_guild: Optional[discord.Guild] = None):
-        """Auto-bypass multiple links and send to specified channel"""
+        """Process multiple links and send results to designated channel"""
         if not self.auto_bypass_channel:
-            logger.error("Auto-bypass channel not found")
+            logger.error("Auto-bypass channel not available")
             return []
         
         if not urls:
@@ -566,7 +627,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         results = []
         successful_urls = []
         
-        # Process URLs in batches to avoid rate limiting
         BATCH_SIZE = 5
         for i in range(0, len(urls), BATCH_SIZE):
             batch = urls[i:i + BATCH_SIZE]
@@ -580,7 +640,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 ))
                 batch_tasks.append((url, task))
             
-            # Wait for batch to complete
             for url, task in batch_tasks:
                 try:
                     result = await asyncio.wait_for(task, timeout=30)
@@ -594,7 +653,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 except Exception as e:
                     logger.error(f"Error processing URL {url}: {e}")
             
-            # Small delay between batches
             if i + BATCH_SIZE < len(urls):
                 await asyncio.sleep(1)
         
@@ -609,18 +667,16 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             return
         
         try:
-            # Get the ping role mention
             ping_mention = f"<@&{PING_ROLE_ID}>" if self.ping_role else f"<@&{PING_ROLE_ID}>"
             
             if len(successful_urls) == 1:
-                # Send ping message first
-                await self.auto_bypass_channel.send(f"{ping_mention} New game file bypassed!")
+                await self.auto_bypass_channel.send(f"{ping_mention} New game file bypassed")
                 
                 embed = discord.Embed(
                     title="Game File Bypassed",
-                    description="File has been successfully bypassed.",
+                    description="File has been successfully bypassed",
                     color=0x00FF00,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.now(UTC)
                 )
                 
                 final_url = successful_urls[0]
@@ -642,7 +698,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 
                 embed.add_field(
                     name="Status",
-                    value=f"✅ 1/{total_attempted} successful",
+                    value=f"1/{total_attempted} successful",
                     inline=True
                 )
                 
@@ -656,10 +712,8 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 await self.auto_bypass_channel.send(embed=embed, view=view)
                 
             else:
-                # Send ping message for multiple files
-                await self.auto_bypass_channel.send(f"{ping_mention} {len(successful_urls)} game files bypassed!")
+                await self.auto_bypass_channel.send(f"{ping_mention} {len(successful_urls)} game files bypassed")
                 
-                # Group URLs for better display
                 for i in range(0, len(successful_urls), 3):
                     batch_urls = successful_urls[i:i + 3]
                     batch_num = i // 3 + 1
@@ -669,7 +723,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         title=f"Game Files Bypassed (Batch {batch_num}/{total_batches})",
                         description=f"Files {i+1}-{min(i+3, len(successful_urls))} of {len(successful_urls)}",
                         color=0x00FF00,
-                        timestamp=datetime.utcnow()
+                        timestamp=datetime.now(UTC)
                     )
                     
                     for j, final_url in enumerate(batch_urls, 1):
@@ -678,7 +732,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                             display_url = display_url[:147] + "..."
                         
                         embed.add_field(
-                            name=f"Direct Link #{i + j}",
+                            name=f"Direct Link {i + j}",
                             value=f"```{display_url}```",
                             inline=False
                         )
@@ -692,21 +746,21 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         
                         embed.add_field(
                             name="Status",
-                            value=f"✅ {len(successful_urls)}/{total_attempted} successful",
+                            value=f"{len(successful_urls)}/{total_attempted} successful",
                             inline=True
                         )
                     
                     view = discord.ui.View(timeout=None)
                     for j, final_url in enumerate(batch_urls, 1):
                         view.add_item(discord.ui.Button(
-                            label=f"Open Link #{i + j}",
+                            label=f"Open Link {i + j}",
                             url=final_url,
                             style=discord.ButtonStyle.link
                         ))
                     
                     await self.auto_bypass_channel.send(embed=embed, view=view)
             
-            logger.info(f"Auto-bypass results sent to channel with role ping: {len(successful_urls)} URLs")
+            logger.info(f"Auto-bypass results sent to channel: {len(successful_urls)} URLs")
             
         except Exception as e:
             logger.error(f"Failed to send auto-bypass results: {e}")
@@ -764,7 +818,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         await asyncio.sleep(60)
         
         while True:
-            now = datetime.utcnow()
+            now = datetime.now(UTC)
             if self.last_daily_stats_time is None or (now - self.last_daily_stats_time) >= timedelta(hours=24):
                 await self.log_24hour_stats()
                 self.last_daily_stats_time = now
@@ -778,19 +832,32 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
         try:
             cursor = self.db_conn.cursor()
-            twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+            twenty_four_hours_ago = (datetime.now(UTC) - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
             
             cursor.execute('''
                 SELECT 
-                    COUNT(*) as total_requests,
-                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_requests,
-                    COUNT(DISTINCT user_id) as unique_users,
-                    COUNT(DISTINCT guild_id) as unique_servers
+                    COALESCE(COUNT(*), 0) as total_requests,
+                    COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) as successful_requests,
+                    COALESCE(COUNT(DISTINCT user_id), 0) as unique_users,
+                    COALESCE(COUNT(DISTINCT guild_id), 0) as unique_servers
                 FROM bypass_logs 
                 WHERE timestamp >= ?
             ''', (twenty_four_hours_ago,))
             
             stats = cursor.fetchone()
+            
+            if not stats:
+                stats = {
+                    'total_requests': 0,
+                    'successful_requests': 0,
+                    'unique_users': 0,
+                    'unique_servers': 0
+                }
+            
+            total_requests = stats.get('total_requests', 0)
+            successful_requests = stats.get('successful_requests', 0)
+            unique_users = stats.get('unique_users', 0)
+            unique_servers = stats.get('unique_servers', 0)
             
             cursor.execute('''
                 SELECT username, COUNT(*) as request_count 
@@ -814,19 +881,19 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             embed = discord.Embed(
                 title="24 Hour Statistics Report",
                 color=0x7289DA,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC)
             )
             
             success_rate = 0
-            if stats['total_requests'] > 0:
-                success_rate = (stats['successful_requests'] / stats['total_requests']) * 100
+            if total_requests > 0:
+                success_rate = (successful_requests / total_requests) * 100
             
-            embed.add_field(name="Total Requests", value=f"{stats['total_requests']:,}", inline=True)
-            embed.add_field(name="Successful", value=f"{stats['successful_requests']:,}", inline=True)
+            embed.add_field(name="Total Requests", value=f"{total_requests:,}", inline=True)
+            embed.add_field(name="Successful", value=f"{successful_requests:,}", inline=True)
             embed.add_field(name="Success Rate", value=f"{success_rate:.1f}%", inline=True)
             
-            embed.add_field(name="Unique Users", value=f"{stats['unique_users']:,}", inline=True)
-            embed.add_field(name="Unique Servers", value=f"{stats['unique_servers']:,}", inline=True)
+            embed.add_field(name="Unique Users", value=f"{unique_users:,}", inline=True)
+            embed.add_field(name="Unique Servers", value=f"{unique_servers:,}", inline=True)
             embed.add_field(name="Memory Cache", value=f"{len(self.cache):,} entries", inline=True)
             
             if method_counts:
@@ -839,7 +906,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
             embed.add_field(
                 name="Performance Summary",
-                value=f"• Avg Response Time: {self.performance_stats['avg_response_time']:.2f}s\n• Overall Success Rate: {self.performance_stats['success_rate']:.1f}%\n• Active Services: {len([s for s in self.fallback_services if s['priority'] <= 3])}/{len(self.fallback_services)}",
+                value=f"• Average Response Time: {self.performance_stats['avg_response_time']:.2f}s\n• Overall Success Rate: {self.performance_stats['success_rate']:.1f}%\n• Active Services: {len([s for s in self.fallback_services if s['priority'] <= 3])}/{len(self.fallback_services)}",
                 inline=False
             )
             
@@ -902,7 +969,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         
         logger.info(f"Bot started with {len(self.guilds)} guilds")
         
-        # ===== LOAD CHANNELS AND ROLES =====
         # Initialize auto-bypass channel
         try:
             guild = self.get_guild(AUTO_BYPASS_SERVER_ID)
@@ -913,7 +979,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 else:
                     logger.warning(f"Auto-bypass channel not found in guild. ID: {AUTO_BYPASS_CHANNEL_ID}")
                     
-                    # Try to force fetch the channel
                     try:
                         channel = await self.fetch_channel(AUTO_BYPASS_CHANNEL_ID)
                         if isinstance(channel, discord.TextChannel):
@@ -947,7 +1012,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 logger.warning(f"Log guild not found. ID: {LOG_SERVER_ID}")
         except Exception as e:
             logger.error(f"Failed to load log channel: {e}")
-        # ===== END OF CHANNEL LOADING =====
         
         await self.send_startup_notification()
     
@@ -958,15 +1022,15 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 title="Bot Started",
                 description=f"Bot is now online in {len(self.guilds)} servers",
                 color=0x00FF00,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC)
             )
             embed.add_field(name="Bot User", value=f"{self.user} ({self.user.id})", inline=True)
             embed.add_field(name="Database", value="Connected" if self.db_conn else "Disabled", inline=True)
             embed.add_field(name="Auto-bypass Channel", 
-                           value=f"✅ Connected: #{self.auto_bypass_channel.name}" if self.auto_bypass_channel else "❌ Not found", 
+                           value=f"Connected: #{self.auto_bypass_channel.name}" if self.auto_bypass_channel else "Not found", 
                            inline=True)
             embed.add_field(name="Ping Role", 
-                           value=f"✅ Loaded: @{self.ping_role.name}" if self.ping_role else "❌ Not found", 
+                           value=f"Loaded: @{self.ping_role.name}" if self.ping_role else "Not found", 
                            inline=True)
             embed.add_field(name="Cache Size", value=f"{len(self.cache):,} entries", inline=True)
             embed.add_field(name="Authorized Users", value=f"{len(self.auto_bypass_allowed_users):,} users", inline=True)
@@ -985,20 +1049,16 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             if not all([parsed.scheme, parsed.netloc]):
                 return False
             
-            # Convert to lowercase for comparison
             url_lower = url.lower()
             domain = parsed.netloc.lower()
             
-            # Check for ALL Linkvertise domains and subdomains
             for lv_domain in self.linkvertise_domains:
                 if domain == lv_domain or domain.endswith('.' + lv_domain):
                     return True
             
-            # Check for linkvertise in any part of the URL (more lenient)
             if 'linkvertise' in url_lower:
                 return True
             
-            # Check for common Linkvertise URL patterns
             linkvertise_patterns = [
                 r'linkvertise\.(com|net|io|co|download|pw|xyz)',
                 r'up-to-down\.net',
@@ -1013,7 +1073,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 if re.search(pattern, url_lower, re.IGNORECASE):
                     return True
             
-            # If still unsure, check for common Linkvertise path patterns
             common_paths = ['/access/', '/download/', '/view/', '/file/', '/folder/', '/content/', '/media/']
             for path in common_paths:
                 if path in parsed.path:
@@ -1023,32 +1082,29 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
         except Exception as e:
             logger.warning(f"URL validation error for {url}: {e}")
-            # Be lenient - if validation fails, still try to bypass
             return True
     
     def extract_all_linkvertise_urls(self, text: str) -> List[str]:
         """Extract all Linkvertise URLs from text with various formats"""
-        # More comprehensive patterns
         patterns = [
-            r'https?://[^\s<>"\']*linkvertise[^\s<>"\']*',  # Standard URLs
-            r'\[[^\]]*\]\s*\(\s*(https?://[^\s<>"\']*linkvertise[^\s<>"\']*)\s*\)',  # Markdown
-            r'[\[\(]?\s*(https?://[^\s<>"\']*linkvertise[^\s<>"\']*)\s*[\]\)]?',  # Brackets
-            r'(?:https?://)?(?:www\.)?linkvertise\.(?:com|net|io|co)/(?:[^\s<>"\']+)',  # Short form
+            r'https?://[^\s<>"\']*linkvertise[^\s<>"\']*',
+            r'\[[^\]]*\]\s*\(\s*(https?://[^\s<>"\']*linkvertise[^\s<>"\']*)\s*\)',
+            r'[\[\(]?\s*(https?://[^\s<>"\']*linkvertise[^\s<>"\']*)\s*[\]\)]?',
+            r'(?:https?://)?(?:www\.)?linkvertise\.(?:com|net|io|co)/(?:[^\s<>"\']+)',
         ]
         
-        all_urls = []
+        all_urls = set()
         
         for pattern in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
-                # Clean the URL
                 if isinstance(match, tuple):
                     match = match[0]
                 url = match.strip('[]()<>"\'')
-                if url and self.is_valid_linkvertise_url(url) and url not in all_urls:
-                    all_urls.append(url)
+                if url and self.is_valid_linkvertise_url(url):
+                    all_urls.add(url)
     
-        return all_urls
+        return list(all_urls)
     
     def extract_linkvertise_urls(self, text: str) -> List[str]:
         return self.extract_all_linkvertise_urls(text)
@@ -1086,7 +1142,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             return False, reset_in, f"Rate limit exceeded ({self.MAX_REQUESTS_PER_WINDOW}/min). Try again in {reset_in}s"
         
         recent_requests.append(now)
-        self.request_count[user_id] = recent_requests[-50:]  # Keep only last 50 requests
+        self.request_count[user_id] = recent_requests[-50:]
         user_data['total_requests'] += 1
         user_data['daily_requests'] += 1
         user_data['last_request'] = now
@@ -1099,13 +1155,11 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             parsed = urlparse(url)
             query_params = parse_qs(parsed.query)
             
-            # Check for 'r' parameter (base64 encoded URL)
             if 'r' in query_params:
                 encoded = query_params['r'][0]
                 
                 for encoded_str in [encoded, unquote(encoded)]:
                     try:
-                        # Add padding if needed
                         padding = 4 - (len(encoded_str) % 4)
                         if padding != 4:
                             encoded_str += '=' * padding
@@ -1117,7 +1171,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     except:
                         continue
             
-            # Check for other common parameters
             for param in ['url', 'link', 'redirect', 'destination', 'target', 'dl']:
                 if param in query_params:
                     potential_url = query_params[param][0]
@@ -1151,7 +1204,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         return BypassResult(
                             success=True,
                             url=final_url,
-                            message="Dynamic link decoded and resolved successfully",
+                            message="Dynamic link decoded and resolved",
                             method=BypassMethod.DYNAMIC_DECODE,
                             execution_time=time.time() - start_time,
                             original_url=url
@@ -1162,7 +1215,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     return BypassResult(
                         success=True,
                         url=extracted,
-                        message="Dynamic link decoded successfully (redirect failed)",
+                        message="Dynamic link decoded successfully",
                         method=BypassMethod.DYNAMIC_DECODE,
                         execution_time=time.time() - start_time,
                         original_url=url
@@ -1220,17 +1273,16 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     original_url=url
                 )
             
-            # Try multiple patterns to extract link ID
             link_id = None
             id_patterns = [
-                r'/(\d+)(?:/|$)',  # /123456/
-                r'/access/(\d+)/',  # /access/123456/
-                r'/download/(\d+)/',  # /download/123456/
-                r'/view/(\d+)/',  # /view/123456/
-                r'/file/(\d+)/',  # /file/123456/
-                r'/folder/(\d+)/',  # /folder/123456/
-                r'/content/(\d+)/',  # /content/123456/
-                r'/media/(\d+)/',  # /media/123456/
+                r'/(\d+)(?:/|$)',
+                r'/access/(\d+)/',
+                r'/download/(\d+)/',
+                r'/view/(\d+)/',
+                r'/file/(\d+)/',
+                r'/folder/(\d+)/',
+                r'/content/(\d+)/',
+                r'/media/(\d+)/',
             ]
             
             for pattern in id_patterns:
@@ -1239,7 +1291,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     link_id = match.group(1)
                     break
             
-            # Also check query parameters
             if not link_id:
                 query_params = parse_qs(parsed.query)
                 for param in ['id', 'link', 'file', 'download', 'content', 'media']:
@@ -1250,10 +1301,8 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                             break
             
             if not link_id:
-                # Try to find any numeric ID in the path
                 numeric_parts = re.findall(r'\d+', path)
                 if numeric_parts:
-                    # Take the longest numeric part (most likely to be an ID)
                     link_id = max(numeric_parts, key=len)
             
             if not link_id:
@@ -1266,7 +1315,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     original_url=url
                 )
             
-            # Try multiple API endpoints
             api_endpoints = [
                 f"https://publisher.linkvertise.com/api/v1/redirect/link/{link_id}/target",
                 f"https://publisher.linkvertise.com/api/v1/redirect/link/static/{link_id}",
@@ -1348,7 +1396,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         return BypassResult(
                             success=True,
                             url=actual_final_url,
-                            message="API bypass successful - got final URL",
+                            message="API bypass successful",
                             method=BypassMethod.API_BYPASS,
                             execution_time=time.time() - start_time,
                             original_url=url
@@ -1372,7 +1420,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         original_url=url
                     )
             
-            # If API fails, try page content extraction
             return await self.extract_from_page_content(url, cache_key, start_time)
             
         except Exception as e:
@@ -1583,7 +1630,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         )
     
     async def bypass_linkvertise(self, url: str, user_id: int, guild_id: Optional[int] = None) -> BypassResult:
-        """Main bypass function that tries ALL methods"""
+        """Main bypass function"""
         logger.info(f"Processing bypass request for {url} from user {user_id}")
         
         if url in self.blocked_urls:
@@ -1598,12 +1645,30 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 guild_id=guild_id
             )
         
-        # Check cache first
         cache_key = self.get_cache_key(url)
         if cache_key in self.cache:
             cached_url, _, method = self.cache[cache_key]
             self.update_cache_order(cache_key)
             self.method_stats[BypassMethod.CACHED.value] += 1
+            
+            if "roblox.com/games/" in cached_url.lower():
+                is_available, status_msg, game_id = await self.check_roblox_game_availability(cached_url)
+                if not is_available:
+                    del self.cache[cache_key]
+                    if cache_key in self.cache_order:
+                        self.cache_order.remove(cache_key)
+                        
+                    return BypassResult(
+                        success=False,
+                        url=cached_url,
+                        message=f"Game is unavailable: {status_msg}",
+                        method=BypassMethod.CACHED,
+                        execution_time=0.01,
+                        original_url=url,
+                        user_id=user_id,
+                        guild_id=guild_id,
+                        additional_info={"game_id": game_id, "status": "unavailable"}
+                    )
             
             result = BypassResult(
                 success=True,
@@ -1621,7 +1686,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
             return result
         
-        # Try methods in order of speed/success rate
         methods = [
             (self.bypass_dynamic_link, "Dynamic decode"),
             (self.bypass_api_link, "API bypass"),
@@ -1635,11 +1699,29 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 result = await method_func(url)
                 all_results.append(result)
                 
-                if result.success:
+                if result.success and result.url:
+                    if "roblox.com/games/" in result.url.lower():
+                        is_available, status_msg, game_id = await self.check_roblox_game_availability(result.url)
+                        
+                        if not is_available:
+                            result.success = False
+                            result.message = f"Bypass succeeded but game is unavailable: {status_msg}"
+                            result.additional_info = {"game_id": game_id, "status": "unavailable"}
+                            
+                            if user_id in self.user_stats:
+                                self.user_stats[user_id]['failed_bypasses'] += 1
+                            
+                            return result
+                        
+                        result.additional_info = {
+                            "game_id": game_id,
+                            "status": "available",
+                            "status_msg": status_msg
+                        }
+                    
                     result.user_id = user_id
                     result.guild_id = guild_id
                     
-                    # Save to cache
                     self.cache[cache_key] = (result.url, time.time(), result.method)
                     self.update_cache_order(cache_key)
                     
@@ -1651,11 +1733,11 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         self.user_stats[user_id]['successful_bypasses'] += 1
                     
                     return result
+                    
             except Exception as e:
                 logger.warning(f"{method_name} failed for {url}: {e}")
                 continue
         
-        # If all methods failed, return the best result
         best_result = None
         for result in all_results:
             if result.url and (best_result is None or result.execution_time < best_result.execution_time):
@@ -1668,7 +1750,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 self.user_stats[user_id]['failed_bypasses'] += 1
             return best_result
         
-        # Complete failure
         result = BypassResult(
             success=False,
             url=None,
@@ -1694,7 +1775,6 @@ bot = EnhancedLinkvertiseBypassBot()
 async def bypass_command(interaction: discord.Interaction, url: str):
     await interaction.response.defer(thinking=True)
     
-    # BLOCK DM USAGE
     if not interaction.guild:
         embed = discord.Embed(
             title="Command Not Available",
@@ -1738,12 +1818,25 @@ async def bypass_command(interaction: discord.Interaction, url: str):
     await bot.log_to_database(result, interaction.user, interaction.guild)
     await bot.send_log_to_discord(result, interaction.user, interaction.guild)
     
+    game_status = None
+    game_id = None
+    if result.additional_info and "game_id" in result.additional_info:
+        game_id = result.additional_info.get("game_id")
+        game_status = result.additional_info.get("status_msg", result.additional_info.get("status"))
+    
     if result.success:
         embed = discord.Embed(
-            title="✅ Bypass Successful",
+            title="Bypass Successful",
             color=0x00FF00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(UTC)
         )
+        
+        if game_status:
+            embed.add_field(
+                name="Game Status",
+                value=f"{game_status}",
+                inline=True
+            )
         
         embed.add_field(
             name="Original Link",
@@ -1759,20 +1852,20 @@ async def bypass_command(interaction: discord.Interaction, url: str):
         
         embed.add_field(
             name="Method",
-            value=f"`{result.method.value.replace('_', ' ').title()}`",
+            value=f"{result.method.value.replace('_', ' ').title()}",
             inline=True
         )
         
         embed.add_field(
             name="Time",
-            value=f"`{result.execution_time:.2f}s`",
+            value=f"{result.execution_time:.2f}s",
             inline=True
         )
         
         if interaction.user.id not in bot.auto_bypass_allowed_users:
             embed.add_field(
-                name="Want More Features?",
-                value=f"Get access to **/autobypass** and **/batch** commands!\nUse `/request_access` to learn how.",
+                name="Additional Features",
+                value=f"Access to autobypass and batch commands available.\nUse request_access command to learn how.",
                 inline=False
             )
         
@@ -1788,18 +1881,16 @@ async def bypass_command(interaction: discord.Interaction, url: str):
             style=discord.ButtonStyle.link
         ))
         
-        # Also send to auto-bypass channel if user is authorized
         if interaction.user.id in bot.auto_bypass_allowed_users and bot.auto_bypass_channel:
             try:
-                # Send ping message
                 ping_mention = f"<@&{PING_ROLE_ID}>" if bot.ping_role else f"<@&{PING_ROLE_ID}>"
-                await bot.auto_bypass_channel.send(f"{ping_mention} Game file bypassed via command!")
+                await bot.auto_bypass_channel.send(f"{ping_mention} Game file bypassed via command")
                 
                 embed_channel = discord.Embed(
                     title="Game File Bypassed",
-                    description="File has been successfully bypassed.",
+                    description="File has been successfully bypassed",
                     color=0x00FF00,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.now(UTC)
                 )
                 
                 display_url = result.url
@@ -1820,7 +1911,7 @@ async def bypass_command(interaction: discord.Interaction, url: str):
                 
                 embed_channel.add_field(
                     name="Source",
-                    value=f"Via `/bypass` in {interaction.guild.name}",
+                    value=f"Via bypass command in {interaction.guild.name}",
                     inline=True
                 )
                 
@@ -1839,37 +1930,66 @@ async def bypass_command(interaction: discord.Interaction, url: str):
         await interaction.followup.send(embed=embed, view=view)
         
     else:
-        embed = discord.Embed(
-            title="❌ Bypass Failed",
-            description=result.message,
-            color=0xFF0000,
-            timestamp=datetime.utcnow()
-        )
-        
-        embed.add_field(
-            name="URL",
-            value=f"```{url[:150] if len(url) > 150 else url}```",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Method Tried",
-            value=f"`{result.method.value.replace('_', ' ').title()}`",
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Troubleshooting",
-            value="• Try a different Linkvertise URL\n• Check if the URL is valid\n• The link might be expired or private",
-            inline=False
-        )
-        
-        embed.set_footer(text="Try again with a different link")
+        if "unavailable" in result.message.lower() or "terminated" in result.message.lower():
+            embed = discord.Embed(
+                title="Game Unavailable",
+                description=result.message,
+                color=0xFF0000,
+                timestamp=datetime.now(UTC)
+            )
+            
+            embed.add_field(
+                name="Original Link",
+                value=f"```{url[:150] if len(url) > 150 else url}```",
+                inline=False
+            )
+            
+            if game_id:
+                embed.add_field(
+                    name="Game ID",
+                    value=f"{game_id}",
+                    inline=True
+                )
+            
+            embed.add_field(
+                name="Status Details",
+                value="• Game is banned or terminated\n• Game link is expired\n• Game is private or restricted",
+                inline=False
+            )
+            
+            embed.set_footer(text="Try a different game link")
+        else:
+            embed = discord.Embed(
+                title="Bypass Failed",
+                description=result.message,
+                color=0xFF0000,
+                timestamp=datetime.now(UTC)
+            )
+            
+            embed.add_field(
+                name="URL",
+                value=f"```{url[:150] if len(url) > 150 else url}```",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="Method Tried",
+                value=f"{result.method.value.replace('_', ' ').title()}",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="Troubleshooting",
+                value="• Try a different Linkvertise URL\n• Check if the URL is valid\n• The link might be expired or private",
+                inline=False
+            )
+            
+            embed.set_footer(text="Try again with a different link")
         
         await interaction.followup.send(embed=embed)
 
 # ============ PBYPASS COMMAND ============
-@bot.tree.command(name="pbypass", description="PRIVATE bypass - Bypass links without sending to channel")
+@bot.tree.command(name="pbypass", description="Private bypass - Bypass links without sending to channel")
 @app_commands.describe(url="The Linkvertise URL to bypass privately")
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: (i.guild_id, i.user.id) if i.guild_id else i.user.id)
 async def pbypass_command(interaction: discord.Interaction, url: str):
@@ -1919,9 +2039,9 @@ async def pbypass_command(interaction: discord.Interaction, url: str):
     
     if result.success:
         embed = discord.Embed(
-            title="✅ Private Bypass Successful",
+            title="Private Bypass Successful",
             color=0x00FF00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(UTC)
         )
         
         embed.add_field(
@@ -1938,13 +2058,13 @@ async def pbypass_command(interaction: discord.Interaction, url: str):
         
         embed.add_field(
             name="Method",
-            value=f"`{result.method.value.replace('_', ' ').title()}`",
+            value=f"{result.method.value.replace('_', ' ').title()}",
             inline=True
         )
         
         embed.add_field(
             name="Time",
-            value=f"`{result.execution_time:.2f}s`",
+            value=f"{result.execution_time:.2f}s",
             inline=True
         )
         
@@ -1964,10 +2084,10 @@ async def pbypass_command(interaction: discord.Interaction, url: str):
         
     else:
         embed = discord.Embed(
-            title="❌ Private Bypass Failed",
+            title="Private Bypass Failed",
             description=result.message,
             color=0xFF0000,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(UTC)
         )
         
         embed.add_field(
@@ -1978,7 +2098,7 @@ async def pbypass_command(interaction: discord.Interaction, url: str):
         
         embed.add_field(
             name="Method Tried",
-            value=f"`{result.method.value.replace('_', ' ').title()}`",
+            value=f"{result.method.value.replace('_', ' ').title()}",
             inline=True
         )
         
@@ -2040,31 +2160,30 @@ async def autobypass_command(interaction: discord.Interaction, links: str):
     if interaction.user.id not in bot.auto_bypass_allowed_users:
         embed = discord.Embed(
             title="Access Denied",
-            description="You are not authorized to use auto-bypass.\n\n**Only authorized users can use this command.**",
+            description="You are not authorized to use auto-bypass. Only authorized users can use this command.",
             color=0xFF0000
         )
         
         if interaction.guild and interaction.guild.id == AUTO_BYPASS_SERVER_ID:
             embed.add_field(
-                name="Want Access?",
-                value=f"Ask <@{YOUR_USER_ID}> to authorize you using `/autobypass_users add @yourname`",
+                name="Request Access",
+                value=f"Ask {YOUR_USER_ID} to authorize you using autobypass_users add command",
                 inline=False
             )
         
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
-    url_list = []
+    # Extract unique URLs using regex first
+    extracted_urls = set(bot.extract_linkvertise_urls(links))
+    
+    # Also split by commas for manual input
     for link in links.split(','):
         link = link.strip()
         if link and bot.is_valid_linkvertise_url(link):
-            url_list.append(link)
+            extracted_urls.add(link)
     
-    # Also extract any missed URLs using regex
-    extracted_urls = bot.extract_linkvertise_urls(links)
-    for url in extracted_urls:
-        if url not in url_list and bot.is_valid_linkvertise_url(url):
-            url_list.append(url)
+    url_list = list(extracted_urls)
     
     if not url_list:
         embed = discord.Embed(
@@ -2075,7 +2194,7 @@ async def autobypass_command(interaction: discord.Interaction, links: str):
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
     
-    MAX_AUTO_BYPASS = 100  # Increased limit
+    MAX_AUTO_BYPASS = 100
     if len(url_list) > MAX_AUTO_BYPASS:
         url_list = url_list[:MAX_AUTO_BYPASS]
         warning = f"Limited to first {MAX_AUTO_BYPASS} URLs"
@@ -2090,21 +2209,21 @@ async def autobypass_command(interaction: discord.Interaction, links: str):
     
     if successful_urls:
         embed = discord.Embed(
-            title="✅ Auto-Bypass Complete",
-            description=f"Successfully bypassed **{len(successful_urls)}/{len(url_list)}** links.",
+            title="Auto-Bypass Complete",
+            description=f"Successfully bypassed {len(successful_urls)}/{len(url_list)} links.",
             color=0x00FF00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(UTC)
         )
         
         embed.add_field(
             name="Results Sent To",
-            value=f"<#{AUTO_BYPASS_CHANNEL_ID}>",
+            value=f"Channel: {AUTO_BYPASS_CHANNEL_ID}",
             inline=True
         )
         
         embed.add_field(
             name="Processing Time",
-            value=f"Approx. {len(url_list) * 2}s",
+            value=f"Approximately {len(url_list) * 2}s",
             inline=True
         )
         
@@ -2112,10 +2231,10 @@ async def autobypass_command(interaction: discord.Interaction, links: str):
             examples = []
             for i, url in enumerate(successful_urls[:5], 1):
                 filename = url.split('/')[-1][:30]
-                examples.append(f"**{i}.** `{filename}...`")
+                examples.append(f"{i}. {filename}...")
             
             if len(successful_urls) > 5:
-                examples.append(f"... and **{len(successful_urls) - 5}** more")
+                examples.append(f"... and {len(successful_urls) - 5} more")
             
             embed.add_field(
                 name="Bypassed Files",
@@ -2136,7 +2255,7 @@ async def autobypass_command(interaction: discord.Interaction, links: str):
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     else:
         embed = discord.Embed(
-            title="❌ Auto-Bypass Failed",
+            title="Auto-Bypass Failed",
             description="No links were successfully bypassed.",
             color=0xFF0000
         )
@@ -2181,23 +2300,23 @@ async def batch_command(interaction: discord.Interaction, links: str):
         
         embed.add_field(
             name="How to Get Access",
-            value=f"Ask <@{YOUR_USER_ID}> to grant you batch command access.\n\nUse `/request_access` for more info.",
+            value=f"Ask {YOUR_USER_ID} to grant you batch command access. Use request_access command for more information.",
             inline=False
         )
         
         await interaction.followup.send(embed=embed)
         return
     
-    url_list = []
+    # Extract unique URLs using regex first
+    extracted_urls = set(bot.extract_linkvertise_urls(links))
+    
+    # Also split by commas for manual input
     for link in links.split(','):
         link = link.strip()
         if link and bot.is_valid_linkvertise_url(link):
-            url_list.append(link)
+            extracted_urls.add(link)
     
-    extracted_urls = bot.extract_linkvertise_urls(links)
-    for url in extracted_urls:
-        if url not in url_list and bot.is_valid_linkvertise_url(url):
-            url_list.append(url)
+    url_list = list(extracted_urls)
     
     if not url_list:
         embed = discord.Embed(
@@ -2208,7 +2327,7 @@ async def batch_command(interaction: discord.Interaction, links: str):
         await interaction.followup.send(embed=embed)
         return
     
-    if len(url_list) > 15:  # Increased limit
+    if len(url_list) > 15:
         url_list = url_list[:15]
         warning = "Limited to first 15 URLs"
     else:
@@ -2219,7 +2338,6 @@ async def batch_command(interaction: discord.Interaction, links: str):
     successful_urls = []
     failed_urls = []
     
-    # Process in batches
     BATCH_SIZE = 3
     for i in range(0, len(url_list), BATCH_SIZE):
         batch = url_list[i:i + BATCH_SIZE]
@@ -2243,7 +2361,6 @@ async def batch_command(interaction: discord.Interaction, links: str):
                 failed_urls.append(url)
                 logger.warning(f"Timeout while processing URL: {url}")
         
-        # Small delay between batches
         if i + BATCH_SIZE < len(url_list):
             await asyncio.sleep(0.5)
     
@@ -2252,12 +2369,12 @@ async def batch_command(interaction: discord.Interaction, links: str):
     embed = discord.Embed(
         title="Batch Bypass Results",
         color=color,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC)
     )
     
     embed.add_field(
         name="Summary",
-        value=f"**{successful}/{len(results)}** successful bypasses",
+        value=f"{successful}/{len(results)} successful bypasses",
         inline=False
     )
     
@@ -2266,12 +2383,12 @@ async def batch_command(interaction: discord.Interaction, links: str):
         for i, (original_url, success, _, direct_url) in enumerate(results):
             if success and i < 5:
                 filename = original_url.split('/')[-1][:40]
-                display_list.append(f"• `{filename}...`")
+                display_list.append(f"• {filename}...")
         
         display = "\n".join(display_list)
         
         if len(successful_urls) > 5:
-            display += f"\n• ... and **{len(successful_urls) - 5}** more"
+            display += f"\n• ... and {len(successful_urls) - 5} more"
         
         embed.add_field(
             name="Successful Bypasses",
@@ -2283,12 +2400,12 @@ async def batch_command(interaction: discord.Interaction, links: str):
         display_list = []
         for url in failed_urls[:3]:
             filename = url.split('/')[-1][:40]
-            display_list.append(f"• `{filename}...`")
+            display_list.append(f"• {filename}...")
         
         display = "\n".join(display_list)
         
         if len(failed_urls) > 3:
-            display += f"\n• ... and **{len(failed_urls) - 3}** more"
+            display += f"\n• ... and {len(failed_urls) - 3} more"
         
         embed.add_field(
             name="Failed URLs",
@@ -2301,7 +2418,6 @@ async def batch_command(interaction: discord.Interaction, links: str):
     
     if successful_urls:
         view = discord.ui.View(timeout=180)
-        # Add buttons for up to 5 successful URLs
         for i, direct_url in enumerate(successful_urls[:5]):
             button_label = f"Link {i+1}" if i < len(successful_urls) else f"URL {i+1}"
             
@@ -2326,32 +2442,32 @@ async def stats_command(interaction: discord.Interaction):
         success_rate = (stats['successful_bypasses'] / max(stats['total_requests'], 1)) * 100
         
         embed = discord.Embed(
-            title="📊 Your Bypass Statistics",
+            title="Your Bypass Statistics",
             color=0x7289DA,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(UTC)
         )
         
         embed.add_field(
             name="Total Requests",
-            value=f"**{stats['total_requests']}**",
+            value=f"{stats['total_requests']}",
             inline=True
         )
         
         embed.add_field(
             name="Successful",
-            value=f"**{stats['successful_bypasses']}**",
+            value=f"{stats['successful_bypasses']}",
             inline=True
         )
         
         embed.add_field(
             name="Failed",
-            value=f"**{stats['failed_bypasses']}**",
+            value=f"{stats['failed_bypasses']}",
             inline=True
         )
         
         embed.add_field(
             name="Success Rate",
-            value=f"**{success_rate:.1f}%**",
+            value=f"{success_rate:.1f}%",
             inline=True
         )
         
@@ -2361,13 +2477,13 @@ async def stats_command(interaction: discord.Interaction):
         
         embed.add_field(
             name="Daily Usage",
-            value=f"**{daily_used}/{bot.DAILY_LIMIT}**",
+            value=f"{daily_used}/{bot.DAILY_LIMIT}",
             inline=True
         )
         
         embed.add_field(
             name="Daily Remaining",
-            value=f"**{max(0, daily_remaining)}**",
+            value=f"{max(0, daily_remaining)}",
             inline=True
         )
         
@@ -2378,13 +2494,13 @@ async def stats_command(interaction: discord.Interaction):
         
         embed.add_field(
             name="Current Minute",
-            value=f"**{len(recent_requests)}/{bot.MAX_REQUESTS_PER_WINDOW}**",
+            value=f"{len(recent_requests)}/{bot.MAX_REQUESTS_PER_WINDOW}",
             inline=True
         )
         
         embed.add_field(
             name="Remaining Requests",
-            value=f"**{remaining}**",
+            value=f"{remaining}",
             inline=True
         )
         
@@ -2392,7 +2508,7 @@ async def stats_command(interaction: discord.Interaction):
         if last_request:
             embed.add_field(
                 name="Last Request",
-                value=f"<t:{int(last_request)}:R>",
+                value=f"{int(last_request)}",
                 inline=True
             )
         
@@ -2400,7 +2516,7 @@ async def stats_command(interaction: discord.Interaction):
         
     else:
         embed = discord.Embed(
-            title="📊 Your Statistics",
+            title="Your Statistics",
             description="You haven't made any bypass requests yet.",
             color=0x7289DA
         )
@@ -2411,14 +2527,14 @@ async def stats_command(interaction: discord.Interaction):
 @bot.tree.command(name="cache", description="View cache statistics")
 async def cache_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="📦 Cache Statistics",
+        title="Cache Statistics",
         color=0x7289DA,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC)
     )
     
     embed.add_field(
         name="Total Cached URLs",
-        value=f"**{len(bot.cache):,}**",
+        value=f"{len(bot.cache):,}",
         inline=True
     )
     
@@ -2434,30 +2550,30 @@ async def cache_command(interaction: discord.Interaction):
             old += 1
     
     embed.add_field(
-        name="< 1 hour",
-        value=f"**{recent}**",
+        name="Less than 1 hour",
+        value=f"{recent}",
         inline=True
     )
     
     embed.add_field(
-        name="> 1 hour",
-        value=f"**{old}**",
+        name="More than 1 hour",
+        value=f"{old}",
         inline=True
     )
     
     embed.add_field(
         name="Database Cache",
-        value=f"**{bot.MAX_CACHE_SIZE:,}** max entries",
+        value=f"{bot.MAX_CACHE_SIZE:,} maximum entries",
         inline=True
     )
     
     embed.add_field(
         name="Cache TTL",
-        value=f"**{bot.CACHE_TTL//3600} hours**",
+        value=f"{bot.CACHE_TTL//3600} hours",
         inline=True
     )
     
-    method_stats_text = "\n".join([f"• **{method}**: {count:,}" for method, count in bot.method_stats.items() if count > 0])
+    method_stats_text = "\n".join([f"• {method}: {count:,}" for method, count in bot.method_stats.items() if count > 0])
     embed.add_field(
         name="Bypass Methods Used",
         value=method_stats_text or "No methods used yet",
@@ -2467,7 +2583,7 @@ async def cache_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ============ AUTO BYPASS USERS COMMAND ============
-@bot.tree.command(name="autobypass_users", description="[ADMIN] Manage auto-bypass authorized users")
+@bot.tree.command(name="autobypass_users", description="Admin - Manage auto-bypass authorized users")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     action="Add or remove user",
@@ -2505,16 +2621,16 @@ async def autobypass_users_command(interaction: discord.Interaction, action: str
             bot.auto_bypass_allowed_users.remove(user.id)
         
         embed = discord.Embed(
-            title="✅ User Authorized",
+            title="User Authorized",
             description=f"Added {user.mention} to authorized users.",
             color=0x00FF00
         )
         
         permissions = []
         if can_auto_bypass:
-            permissions.append("**Auto-Bypass** (`/autobypass`)")
+            permissions.append("Auto-Bypass")
         if can_use_batch:
-            permissions.append("**Batch Command** (`/batch`)")
+            permissions.append("Batch Command")
         
         if permissions:
             embed.add_field(
@@ -2531,7 +2647,7 @@ async def autobypass_users_command(interaction: discord.Interaction, action: str
             bot.auto_bypass_allowed_users.remove(user.id)
         
         embed = discord.Embed(
-            title="✅ User Removed",
+            title="User Removed",
             description=f"Removed {user.mention} from authorized users.",
             color=0x00FF00
         )
@@ -2560,22 +2676,22 @@ async def autobypass_users_command(interaction: discord.Interaction, action: str
                 users_list.append(f"• {username} - {perm_text}")
             
             embed = discord.Embed(
-                title="👥 Authorized Users List",
+                title="Authorized Users List",
                 description="\n".join(users_list),
                 color=0x7289DA
             )
             embed.set_footer(text=f"Total: {len(rows)} users")
         else:
             embed = discord.Embed(
-                title="👥 Authorized Users List",
+                title="Authorized Users List",
                 description="No authorized users found.",
                 color=0xFFA500
             )
         
     else:
         embed = discord.Embed(
-            title="❌ Invalid Action",
-            description="Use 'add', 'remove', or 'list'.",
+            title="Invalid Action",
+            description="Use add, remove, or list.",
             color=0xFF0000
         )
     
@@ -2585,25 +2701,25 @@ async def autobypass_users_command(interaction: discord.Interaction, action: str
 @bot.tree.command(name="request_access", description="Request access to premium features")
 async def request_access_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🔒 Request Access to Premium Features",
+        title="Request Access to Premium Features",
         color=0x7289DA
     )
     
     embed.add_field(
         name="Available Features",
-        value="• **Auto-Bypass**: Process unlimited links at once\n• **Batch Command**: Process multiple links with one command",
+        value="• Auto-Bypass: Process unlimited links at once\n• Batch Command: Process multiple links with one command",
         inline=False
     )
     
     embed.add_field(
         name="How to Get Access",
-        value=f"Ask <@{YOUR_USER_ID}> to authorize you in the server.\n\nThey can use: `/autobypass_users add @yourname`",
+        value=f"Ask {YOUR_USER_ID} to authorize you in the server. They can use: autobypass_users add command",
         inline=False
     )
     
     embed.add_field(
         name="Current Status",
-        value="✅ **You have access**" if interaction.user.id in bot.auto_bypass_allowed_users else "❌ **You don't have access**",
+        value="You have access" if interaction.user.id in bot.auto_bypass_allowed_users else "You don't have access",
         inline=False
     )
     
@@ -2611,7 +2727,7 @@ async def request_access_command(interaction: discord.Interaction):
         if interaction.user.id not in bot.auto_bypass_allowed_users:
             embed.add_field(
                 name="Quick Request",
-                value=f"Tag <@{YOUR_USER_ID}> in this server to request access!",
+                value=f"Contact {YOUR_USER_ID} in this server to request access",
                 inline=False
             )
     
@@ -2623,18 +2739,15 @@ async def on_message(message):
     if message.author == bot.user or message.author.bot:
         return
     
-    # Auto-detect Linkvertise URLs in guild messages
     if message.guild:
         urls = bot.extract_linkvertise_urls(message.content)
         
         if urls:
-            # Check if user is authorized for auto-bypass
             if message.author.id in bot.auto_bypass_allowed_users:
-                # Ask if they want to auto-bypass
                 view = discord.ui.View(timeout=60)
                 
                 button_auto = discord.ui.Button(
-                    label="🚀 Auto-Bypass All Links",
+                    label="Auto-Bypass All Links",
                     style=discord.ButtonStyle.green,
                     custom_id=f"auto_bypass_all_{message.id}"
                 )
@@ -2655,7 +2768,6 @@ async def on_message(message):
                     
                     await interaction.response.defer(thinking=True, ephemeral=True)
                     
-                    # Process all links
                     successful_urls = await bot.auto_bypass_to_channel(
                         urls=urls,
                         user=message.author,
@@ -2664,13 +2776,12 @@ async def on_message(message):
                     
                     if successful_urls:
                         embed = discord.Embed(
-                            title="✅ Auto-Bypass Complete",
-                            description=f"Sent {len(successful_urls)} links to <#{AUTO_BYPASS_CHANNEL_ID}>",
+                            title="Auto-Bypass Complete",
+                            description=f"Sent {len(successful_urls)} links to channel {AUTO_BYPASS_CHANNEL_ID}",
                             color=0x00FF00
                         )
                         await interaction.followup.send(embed=embed, ephemeral=True)
                         
-                        # Delete the original message if possible
                         try:
                             await message.delete()
                         except:
@@ -2682,7 +2793,6 @@ async def on_message(message):
                         )
                 
                 async def single_bypass_callback(interaction: discord.Interaction):
-                    # Existing single bypass logic
                     urls_single = urls[:3]
                     view_single = discord.ui.View(timeout=300)
                     
@@ -2716,10 +2826,9 @@ async def on_message(message):
                 view.add_item(button_auto)
                 view.add_item(button_single)
                 
-                response_text = f"<@{message.author.id}>, detected **{len(urls)}** Linkvertise link(s). Choose an option:"
+                response_text = f"{message.author.mention}, detected {len(urls)} Linkvertise link(s). Choose an option:"
                 
             else:
-                # Regular users only get single bypass
                 urls = urls[:3]
                 view = discord.ui.View(timeout=300)
                 
@@ -2741,7 +2850,7 @@ async def on_message(message):
                     button.callback = button_callback
                     view.add_item(button)
                 
-                response_text = f"Detected **{len(urls)}** Linkvertise link(s). Click below to bypass:"
+                response_text = f"Detected {len(urls)} Linkvertise link(s). Click below to bypass:"
             
             if message.channel.permissions_for(message.guild.me).send_messages:
                 response = await message.reply(
@@ -2750,7 +2859,6 @@ async def on_message(message):
                     mention_author=False
                 )
                 
-                # Cleanup after timeout
                 async def cleanup():
                     await asyncio.sleep(60 if message.author.id in bot.auto_bypass_allowed_users else 300)
                     try:
