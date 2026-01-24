@@ -1153,6 +1153,140 @@ async def bypass_command(interaction: discord.Interaction, url: str):
         )
         await interaction.followup.send(embed=embed)
         return
+@bot.tree.command(name="pbypass", description="PRIVATE bypass - Bypass links without sending to channel")
+@app_commands.describe(url="The Linkvertise URL to bypass privately")
+@app_commands.checks.cooldown(1, 3.0, key=lambda i: (i.guild_id, i.user.id) if i.guild_id else i.user.id)
+async def pbypass_command(interaction: discord.Interaction, url: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    
+    if not interaction.guild:
+        embed = discord.Embed(
+            title="Command Not Available",
+            description="This command can only be used in servers, not in direct messages.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    
+    if not bot.is_valid_linkvertise_url(url):
+        embed = discord.Embed(
+            title="Invalid URL",
+            description="The provided URL is not a valid Linkvertise link.",
+            color=0xFF0000
+        )
+        embed.add_field(
+            name="Supported formats",
+            value="https://linkvertise.com/123456/page\nhttps://linkvertise.com/.../dynamic?r=...\nhttps://linkvertise.net/...",
+            inline=False
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    
+    allowed, reset_time, error_msg = bot.check_rate_limit(interaction.user.id)
+    if not allowed:
+        embed = discord.Embed(
+            title="Rate Limited",
+            description=error_msg or f"Please wait {reset_time} seconds.",
+            color=0xFFA500
+        )
+        embed.set_footer(text=f"Daily limit: {bot.DAILY_LIMIT} requests")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    
+    result = await bot.bypass_linkvertise(
+        url=url,
+        user_id=interaction.user.id,
+        guild_id=interaction.guild.id if interaction.guild else None
+    )
+    
+    await bot.log_to_database(result, interaction.user, interaction.guild)
+    
+    if result.success:
+        embed = discord.Embed(
+            title="✅ Private Bypass Successful",
+            color=0x00FF00,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="Original Link",
+            value=f"```{url[:100] + '...' if len(url) > 100 else url}```",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Direct Link",
+            value=f"```{result.url[:100] + '...' if len(result.url) > 100 else result.url}```",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Method",
+            value=f"`{result.method.value.replace('_', ' ').title()}`",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Time",
+            value=f"`{result.execution_time:.2f}s`",
+            inline=True
+        )
+        
+        embed.set_footer(
+            text=f"Private request by {interaction.user.name}",
+            icon_url=interaction.user.display_avatar.url
+        )
+        
+        view = discord.ui.View(timeout=180)
+        view.add_item(discord.ui.Button(
+            label="Open Direct Link",
+            url=result.url,
+            style=discord.ButtonStyle.link
+        ))
+        
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        
+    else:
+        embed = discord.Embed(
+            title="❌ Private Bypass Failed",
+            description=result.message,
+            color=0xFF0000,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="URL",
+            value=f"```{url[:150] if len(url) > 150 else url}```",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Method Tried",
+            value=f"`{result.method.value.replace('_', ' ').title()}`",
+            inline=True
+        )
+        
+        embed.set_footer(text="Try again with a different link")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@pbypass_command.error
+async def pbypass_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        embed = discord.Embed(
+            title="Command on Cooldown",
+            description=f"Please wait {error.retry_after:.1f} seconds.",
+            color=0xFFA500
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        logger.error(f"Command error: {error}")
+        embed = discord.Embed(
+            title="Unexpected Error",
+            description="An error occurred while processing your request.",
+            color=0xFF0000
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
     
     allowed, reset_time, error_msg = bot.check_rate_limit(interaction.user.id)
     if not allowed:
