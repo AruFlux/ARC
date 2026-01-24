@@ -448,7 +448,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 
                 embed.add_field(
                     name="Status",
-                    value=f"✅ 1/{total_attempted} successful",
+                    value=f"1/{total_attempted} successful",
                     inline=True
                 )
                 
@@ -489,7 +489,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         
                         embed.add_field(
                             name="Status",
-                            value=f"✅ {len(successful_urls)}/{total_attempted} successful",
+                            value=f"{len(successful_urls)}/{total_attempted} successful",
                             inline=True
                         )
                     
@@ -1834,7 +1834,7 @@ async def request_access_command(interaction: discord.Interaction):
     
     embed.add_field(
         name="Current Status",
-        value="✅ **You have access**" if interaction.user.id in bot.auto_bypass_allowed_users else "❌ **You don't have access**",
+        value="**You have access**" if interaction.user.id in bot.auto_bypass_allowed_users else "❌ **You don't have access**",
         inline=False
     )
     
