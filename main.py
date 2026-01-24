@@ -11,7 +11,7 @@ import re
 import asyncio
 import sqlite3
 from urllib.parse import urlparse, parse_qs, unquote
-from typing import Optional, Tuple, Dict, List, Any
+from typing import Optional, Tuple, Dict, List, Any, Set
 from datetime import datetime, timedelta
 import aiohttp
 import logging
@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 # Your specific server ID for logging
 LOG_SERVER_ID = 1463101887141249107
 LOG_CHANNEL_ID = 1463101887871062153
+
+# Auto-bypass channel constants
+YOUR_USER_ID = 783542452756938813
+AUTO_BYPASS_CHANNEL_ID = 1464505405815259305
+AUTO_BYPASS_SERVER_ID = 1463101887141249107
 
 class BypassMethod(Enum):
     DYNAMIC_DECODE = "dynamic_decode"
@@ -88,6 +93,8 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             "linkvertise.net",
             "linkvertise.io",
             "linkvertise.co",
+            "up-to-down.net",
+            "link-to.net",
         ]
         
         # Session management
@@ -97,6 +104,10 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         
         # Logging channel
         self.log_channel: Optional[discord.TextChannel] = None
+        
+        # Auto-bypass system
+        self.auto_bypass_channel: Optional[discord.TextChannel] = None
+        self.auto_bypass_allowed_users: Set[int] = {YOUR_USER_ID}
         
         # Last 24-hour stats timestamp
         self.last_daily_stats_time: Optional[datetime] = None
@@ -116,10 +127,38 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             }
         )
         
+        # Initialize auto-bypass channel
+        self.auto_bypass_channel = self.get_channel(AUTO_BYPASS_CHANNEL_ID)
+        if not self.auto_bypass_channel:
+            guild = self.get_guild(AUTO_BYPASS_SERVER_ID)
+            if guild:
+                self.auto_bypass_channel = guild.get_channel(AUTO_BYPASS_CHANNEL_ID)
+        
+        # Load authorized users from database
+        await self.load_authorized_users()
+        
         # Start background tasks
         self.cleanup_task = asyncio.create_task(self.periodic_cleanup())
         self.stats_task = asyncio.create_task(self.periodic_stats_log())
+    
+    async def load_authorized_users(self):
+        """Load authorized users from database"""
+        if not self.db_conn:
+            return
         
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute('SELECT user_id FROM authorized_users WHERE can_auto_bypass = 1')
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                self.auto_bypass_allowed_users.add(row['user_id'])
+            
+            logger.info(f"Loaded {len(rows)} authorized users from database")
+            
+        except Exception as e:
+            logger.error(f"Failed to load authorized users: {e}")
+    
     async def init_database(self):
         """Initialize SQLite database and tables"""
         try:
@@ -178,6 +217,22 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     unique_servers INTEGER DEFAULT 0
                 )
             ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS authorized_users (
+                    user_id BIGINT PRIMARY KEY,
+                    added_by BIGINT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    can_auto_bypass BOOLEAN DEFAULT 1,
+                    can_use_batch BOOLEAN DEFAULT 0
+                )
+            ''')
+            
+            # Insert your user ID if not exists
+            cursor.execute('''
+                INSERT OR IGNORE INTO authorized_users (user_id, added_by, can_auto_bypass, can_use_batch)
+                VALUES (?, ?, 1, 1)
+            ''', (YOUR_USER_ID, YOUR_USER_ID))
             
             self.db_conn.commit()
             logger.info("SQLite database initialized successfully")
@@ -328,6 +383,129 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             
         except Exception as e:
             logger.error(f"Failed to send log to Discord: {e}")
+    
+    # Auto-bypass methods
+    async def auto_bypass_to_channel(self, urls: List[str], user: discord.User, source_guild: Optional[discord.Guild] = None):
+        """Auto-bypass multiple links and send to specified channel"""
+        if not self.auto_bypass_channel:
+            logger.error("Auto-bypass channel not found")
+            return []
+        
+        if not urls:
+            return []
+        
+        results = []
+        successful_urls = []
+        
+        for url in urls:
+            result = await self.bypass_linkvertise(
+                url=url,
+                user_id=user.id,
+                guild_id=source_guild.id if source_guild else None
+            )
+            
+            results.append(result)
+            
+            if result.success and result.url:
+                successful_urls.append(result.url)
+                await self.log_to_database(result, user, source_guild)
+        
+        if successful_urls:
+            await self.send_auto_bypass_results(successful_urls, user, len(urls))
+        
+        return successful_urls
+    
+    async def send_auto_bypass_results(self, successful_urls: List[str], user: discord.User, total_attempted: int):
+        """Send auto-bypass results to the specified channel"""
+        if not self.auto_bypass_channel:
+            return
+        
+        try:
+            if len(successful_urls) == 1:
+                embed = discord.Embed(
+                    title="Game File Bypassed",
+                    description="File has been successfully bypassed.",
+                    color=0x00FF00,
+                    timestamp=datetime.utcnow()
+                )
+                
+                final_url = successful_urls[0]
+                display_url = final_url
+                if len(display_url) > 200:
+                    display_url = display_url[:197] + "..."
+                
+                embed.add_field(
+                    name="Direct Link",
+                    value=f"```{display_url}```",
+                    inline=False
+                )
+                
+                embed.add_field(
+                    name="Bypassed By",
+                    value=f"{user.mention} ({user.id})",
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="Status",
+                    value=f"✅ 1/{total_attempted} successful",
+                    inline=True
+                )
+                
+                view = discord.ui.View(timeout=None)
+                view.add_item(discord.ui.Button(
+                    label="Open Direct Link",
+                    url=final_url,
+                    style=discord.ButtonStyle.link
+                ))
+                
+                await self.auto_bypass_channel.send(embed=embed, view=view)
+                
+            else:
+                for i, final_url in enumerate(successful_urls, 1):
+                    embed = discord.Embed(
+                        title=f"Game File Bypassed ({i}/{len(successful_urls)})",
+                        description="File has been successfully bypassed.",
+                        color=0x00FF00,
+                        timestamp=datetime.utcnow()
+                    )
+                    
+                    display_url = final_url
+                    if len(display_url) > 200:
+                        display_url = display_url[:197] + "..."
+                    
+                    embed.add_field(
+                        name=f"Direct Link #{i}",
+                        value=f"```{display_url}```",
+                        inline=False
+                    )
+                    
+                    if i == 1:
+                        embed.add_field(
+                            name="Bypassed By",
+                            value=f"{user.mention} ({user.id})",
+                            inline=True
+                        )
+                        
+                        embed.add_field(
+                            name="Status",
+                            value=f"✅ {len(successful_urls)}/{total_attempted} successful",
+                            inline=True
+                        )
+                    
+                    view = discord.ui.View(timeout=None)
+                    view.add_item(discord.ui.Button(
+                        label=f"Open Link #{i}",
+                        url=final_url,
+                        style=discord.ButtonStyle.link
+                    ))
+                    
+                    await self.auto_bypass_channel.send(embed=embed, view=view)
+            
+            logger.info(f"Auto-bypass results sent to channel: {len(successful_urls)} URLs")
+            
+        except Exception as e:
+            logger.error(f"Failed to send auto-bypass results: {e}")
     
     async def close(self):
         """Cleanup on shutdown"""
@@ -490,6 +668,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             )
             embed.add_field(name="Bot User", value=f"{self.user} ({self.user.id})", inline=True)
             embed.add_field(name="Database", value="Connected" if self.db_conn else "Disabled", inline=True)
+            embed.add_field(name="Auto-bypass Channel", value="Connected" if self.auto_bypass_channel else "Not found", inline=True)
             await self.log_channel.send(embed=embed)
     
     def get_cache_key(self, url: str) -> str:
@@ -516,6 +695,26 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         except Exception as e:
             logger.warning(f"URL validation error for {url}: {e}")
             return False
+    
+    def extract_all_linkvertise_urls(self, text: str) -> List[str]:
+        """Extract all Linkvertise URLs from text"""
+        standard_pattern = r'https?://[^\s]*linkvertise[^\s]*'
+        bracket_pattern = r'[\[\(]?\s*(https?://[^\s]*linkvertise[^\s]*)\s*[\]\)]?'
+        markdown_pattern = r'\[[^\]]*\]\s*\(\s*(https?://[^\s]*linkvertise[^\s]*)\s*\)'
+        
+        all_urls = []
+        
+        for pattern in [standard_pattern, bracket_pattern, markdown_pattern]:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                url = match.strip('[]()<>"\'')
+                if self.is_valid_linkvertise_url(url) and url not in all_urls:
+                    all_urls.append(url)
+    
+        return all_urls
+    
+    def extract_linkvertise_urls(self, text: str) -> List[str]:
+        return self.extract_all_linkvertise_urls(text)
     
     def check_rate_limit(self, user_id: int) -> Tuple[bool, int, Optional[str]]:
         now = time.time()
@@ -922,10 +1121,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 self.user_stats[user_id]['failed_bypasses'] += 1
         
         return result
-    
-    def extract_linkvertise_urls(self, text: str) -> List[str]:
-        pattern = r'https?://[^\s]*linkvertise[^\s]*'
-        return re.findall(pattern, text, re.IGNORECASE)
 
 bot = EnhancedLinkvertiseBypassBot()
 
@@ -1010,6 +1205,13 @@ async def bypass_command(interaction: discord.Interaction, url: str):
             inline=True
         )
         
+        if interaction.user.id not in bot.auto_bypass_allowed_users:
+            embed.add_field(
+                name="Want More Features?",
+                value=f"Get access to **/autobypass** and **/batch** commands!\nUse `/request_access` to learn how.",
+                inline=False
+            )
+        
         embed.set_footer(
             text=f"Requested by {interaction.user.name}",
             icon_url=interaction.user.display_avatar.url
@@ -1021,6 +1223,50 @@ async def bypass_command(interaction: discord.Interaction, url: str):
             url=result.url,
             style=discord.ButtonStyle.link
         ))
+        
+        # Also send to auto-bypass channel if user is authorized
+        if interaction.user.id in bot.auto_bypass_allowed_users and bot.auto_bypass_channel:
+            try:
+                embed_channel = discord.Embed(
+                    title="Game File Bypassed",
+                    description="File has been successfully bypassed.",
+                    color=0x00FF00,
+                    timestamp=datetime.utcnow()
+                )
+                
+                display_url = result.url
+                if len(display_url) > 200:
+                    display_url = display_url[:197] + "..."
+                
+                embed_channel.add_field(
+                    name="Direct Link",
+                    value=f"```{display_url}```",
+                    inline=False
+                )
+                
+                embed_channel.add_field(
+                    name="Bypassed By",
+                    value=f"{interaction.user.mention} ({interaction.user.id})",
+                    inline=True
+                )
+                
+                embed_channel.add_field(
+                    name="Source",
+                    value=f"Via `/bypass` in {interaction.guild.name}",
+                    inline=True
+                )
+                
+                view_channel = discord.ui.View(timeout=None)
+                view_channel.add_item(discord.ui.Button(
+                    label="Open Direct Link",
+                    url=result.url,
+                    style=discord.ButtonStyle.link
+                ))
+                
+                await bot.auto_bypass_channel.send(embed=embed_channel, view=view_channel)
+                
+            except Exception as e:
+                logger.error(f"Failed to send to auto-bypass channel: {e}")
         
         await interaction.followup.send(embed=embed, view=view)
         
@@ -1065,6 +1311,258 @@ async def bypass_error(interaction: discord.Interaction, error):
             color=0xFF0000
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="autobypass", description="Auto-bypass multiple links and send to results channel (Authorized users only)")
+@app_commands.describe(
+    links="Links separated by commas (e.g., link1, link2, link3, ...)"
+)
+async def autobypass_command(interaction: discord.Interaction, links: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    
+    if interaction.user.id not in bot.auto_bypass_allowed_users:
+        embed = discord.Embed(
+            title="Access Denied",
+            description="You are not authorized to use auto-bypass.\n\n**Only authorized users can use this command.**",
+            color=0xFF0000
+        )
+        
+        if interaction.guild and interaction.guild.id == AUTO_BYPASS_SERVER_ID:
+            embed.add_field(
+                name="Want Access?",
+                value=f"Ask <@{YOUR_USER_ID}> to authorize you using `/autobypass_users add @yourname`",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    
+    url_list = []
+    for link in links.split(','):
+        link = link.strip()
+        if link and bot.is_valid_linkvertise_url(link):
+            url_list.append(link)
+    
+    extracted_urls = bot.extract_linkvertise_urls(links)
+    for url in extracted_urls:
+        if url not in url_list and bot.is_valid_linkvertise_url(url):
+            url_list.append(url)
+    
+    if not url_list:
+        embed = discord.Embed(
+            title="No Valid URLs",
+            description="No valid Linkvertise URLs found in your input.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    
+    MAX_AUTO_BYPASS = 50
+    if len(url_list) > MAX_AUTO_BYPASS:
+        url_list = url_list[:MAX_AUTO_BYPASS]
+        warning = f"Limited to first {MAX_AUTO_BYPASS} URLs"
+    else:
+        warning = None
+    
+    successful_urls = await bot.auto_bypass_to_channel(
+        urls=url_list,
+        user=interaction.user,
+        source_guild=interaction.guild
+    )
+    
+    if successful_urls:
+        embed = discord.Embed(
+            title="Auto-Bypass Complete",
+            description=f"Successfully bypassed {len(successful_urls)}/{len(url_list)} links.",
+            color=0x00FF00,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="Results Sent To",
+            value=f"<#{AUTO_BYPASS_CHANNEL_ID}>",
+            inline=True
+        )
+        
+        if successful_urls:
+            examples = []
+            for i, url in enumerate(successful_urls[:3], 1):
+                filename = url.split('/')[-1][:30]
+                examples.append(f"{i}. `{filename}...`")
+            
+            if len(successful_urls) > 3:
+                examples.append(f"... and {len(successful_urls) - 3} more")
+            
+            embed.add_field(
+                name="Bypassed Files",
+                value="\n".join(examples),
+                inline=False
+            )
+        
+        if warning:
+            embed.set_footer(text=warning)
+        
+        view = discord.ui.View(timeout=180)
+        view.add_item(discord.ui.Button(
+            label="View Results",
+            url=f"https://discord.com/channels/{AUTO_BYPASS_SERVER_ID}/{AUTO_BYPASS_CHANNEL_ID}",
+            style=discord.ButtonStyle.link
+        ))
+        
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    else:
+        embed = discord.Embed(
+            title="Auto-Bypass Failed",
+            description="No links were successfully bypassed.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="batch", description="Bypass multiple links at once (Authorized users only)")
+@app_commands.describe(
+    links="Links separated by commas (e.g., link1, link2, link3)"
+)
+@app_commands.checks.cooldown(1, 30.0, key=lambda i: (i.guild_id, i.user.id) if i.guild_id else i.user.id)
+async def batch_command(interaction: discord.Interaction, links: str):
+    await interaction.response.defer(thinking=True)
+    
+    if not interaction.guild:
+        embed = discord.Embed(
+            title="Command Not Available",
+            description="This command can only be used in servers, not in direct messages.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
+    cursor = bot.db_conn.cursor()
+    cursor.execute('''
+        SELECT can_use_batch FROM authorized_users WHERE user_id = ?
+    ''', (interaction.user.id,))
+    
+    user_data = cursor.fetchone()
+    
+    if interaction.user.id != YOUR_USER_ID and (not user_data or not user_data['can_use_batch']):
+        embed = discord.Embed(
+            title="Access Denied",
+            description="You need authorization to use the batch command.",
+            color=0xFFA500
+        )
+        
+        embed.add_field(
+            name="How to Get Access",
+            value=f"Ask <@{YOUR_USER_ID}> to grant you batch command access.\n\nUse `/request_access` for more info.",
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed)
+        return
+    
+    url_list = []
+    for link in links.split(','):
+        link = link.strip()
+        if link and bot.is_valid_linkvertise_url(link):
+            url_list.append(link)
+    
+    extracted_urls = bot.extract_linkvertise_urls(links)
+    for url in extracted_urls:
+        if url not in url_list and bot.is_valid_linkvertise_url(url):
+            url_list.append(url)
+    
+    if not url_list:
+        embed = discord.Embed(
+            title="No Valid URLs",
+            description="No valid Linkvertise URLs found in your input.",
+            color=0xFF0000
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
+    if len(url_list) > 10:
+        url_list = url_list[:10]
+        warning = "Limited to first 10 URLs"
+    else:
+        warning = None
+    
+    results = []
+    successful = 0
+    successful_urls = []
+    failed_urls = []
+    
+    for url in url_list:
+        result = await bot.bypass_linkvertise(url, interaction.user.id, interaction.guild.id)
+        results.append((url, result.success, result.message, result.url))
+        if result.success:
+            successful += 1
+            successful_urls.append(result.url)
+        else:
+            failed_urls.append(url)
+    
+    color = 0x00FF00 if successful > 0 else 0xFFA500
+    
+    embed = discord.Embed(
+        title="Batch Bypass Results",
+        color=color,
+        timestamp=datetime.utcnow()
+    )
+    
+    embed.add_field(
+        name="Summary",
+        value=f"{successful}/{len(results)} successful bypasses",
+        inline=False
+    )
+    
+    if successful_urls:
+        display_list = []
+        for i, (original_url, success, _, direct_url) in enumerate(results):
+            if success and i < 3:
+                display_list.append(f"• {original_url[:60]}...")
+        display = "\n".join(display_list)
+        
+        if len(successful_urls) > 3:
+            display += f"\n• ... and {len(successful_urls) - 3} more"
+        
+        embed.add_field(
+            name="Successful Bypasses",
+            value=display,
+            inline=False
+        )
+    
+    if failed_urls:
+        display_list = []
+        for url in failed_urls[:3]:
+            display_list.append(f"• {url[:60]}...")
+        display = "\n".join(display_list)
+        
+        if len(failed_urls) > 3:
+            display += f"\n• ... and {len(failed_urls) - 3} more"
+        
+        embed.add_field(
+            name="Failed URLs",
+            value=display,
+            inline=False
+        )
+    
+    if warning:
+        embed.set_footer(text=warning)
+    
+    if successful_urls:
+        view = discord.ui.View(timeout=180)
+        for i, direct_url in enumerate(successful_urls[:5]):
+            if i < len(url_list):
+                button_label = f"Direct Link {i+1}"
+            else:
+                button_label = f"Link {i+1}"
+            
+            button = discord.ui.Button(
+                label=button_label,
+                url=direct_url,
+                style=discord.ButtonStyle.link
+            )
+            view.add_item(button)
+        
+        await interaction.followup.send(embed=embed, view=view)
+    else:
+        await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="stats", description="View your bypass statistics")
 async def stats_command(interaction: discord.Interaction):
@@ -1157,134 +1655,6 @@ async def stats_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="batch", description="Bypass multiple links at once")
-@app_commands.describe(
-    links="Links separated by commas (e.g., link1, link2, link3)"
-)
-@app_commands.checks.cooldown(1, 30.0, key=lambda i: (i.guild_id, i.user.id) if i.guild_id else i.user.id)
-async def batch_command(interaction: discord.Interaction, links: str):
-    await interaction.response.defer(thinking=True)
-    
-    # BLOCK DM USAGE
-    if not interaction.guild:
-        embed = discord.Embed(
-            title="Command Not Available",
-            description="This command can only be used in servers, not in direct messages.",
-            color=0xFF0000
-        )
-        await interaction.followup.send(embed=embed)
-        return
-    
-    # Split links by commas and clean up whitespace
-    url_list = []
-    for link in links.split(','):
-        link = link.strip()
-        if link and bot.is_valid_linkvertise_url(link):
-            url_list.append(link)
-    
-    # Also extract any missed URLs using regex
-    extracted_urls = bot.extract_linkvertise_urls(links)
-    for url in extracted_urls:
-        if url not in url_list and bot.is_valid_linkvertise_url(url):
-            url_list.append(url)
-    
-    if not url_list:
-        embed = discord.Embed(
-            title="No Valid URLs",
-            description="No valid Linkvertise URLs found in your input.",
-            color=0xFF0000
-        )
-        await interaction.followup.send(embed=embed)
-        return
-    
-    if len(url_list) > 10:
-        url_list = url_list[:10]
-        warning = "Limited to first 10 URLs"
-    else:
-        warning = None
-    
-    results = []
-    successful = 0
-    successful_urls = []
-    failed_urls = []
-    
-    for url in url_list:
-        result = await bot.bypass_linkvertise(url, interaction.user.id, interaction.guild.id)
-        results.append((url, result.success, result.message, result.url))
-        if result.success:
-            successful += 1
-            successful_urls.append(result.url)
-        else:
-            failed_urls.append(url)
-    
-    color = 0x00FF00 if successful > 0 else 0xFFA500
-    
-    embed = discord.Embed(
-        title="Batch Bypass Results",
-        color=color,
-        timestamp=datetime.utcnow()
-    )
-    
-    embed.add_field(
-        name="Summary",
-        value=f"{successful}/{len(results)} successful bypasses",
-        inline=False
-    )
-    
-    if successful_urls:
-        display_list = []
-        for i, (original_url, success, _, direct_url) in enumerate(results):
-            if success and i < 3:
-                display_list.append(f"• {original_url[:60]}...")
-        display = "\n".join(display_list)
-        
-        if len(successful_urls) > 3:
-            display += f"\n• ... and {len(successful_urls) - 3} more"
-        
-        embed.add_field(
-            name="Successful Bypasses",
-            value=display,
-            inline=False
-        )
-    
-    if failed_urls:
-        display_list = []
-        for url in failed_urls[:3]:
-            display_list.append(f"• {url[:60]}...")
-        display = "\n".join(display_list)
-        
-        if len(failed_urls) > 3:
-            display += f"\n• ... and {len(failed_urls) - 3} more"
-        
-        embed.add_field(
-            name="Failed URLs",
-            value=display,
-            inline=False
-        )
-    
-    if warning:
-        embed.set_footer(text=warning)
-    
-    # Create view with buttons for direct links
-    if successful_urls:
-        view = discord.ui.View(timeout=180)
-        for i, direct_url in enumerate(successful_urls[:5]):
-            if i < len(url_list):
-                button_label = f"Direct Link {i+1}"
-            else:
-                button_label = f"Link {i+1}"
-            
-            button = discord.ui.Button(
-                label=button_label,
-                url=direct_url,
-                style=discord.ButtonStyle.link
-            )
-            view.add_item(button)
-        
-        await interaction.followup.send(embed=embed, view=view)
-    else:
-        await interaction.followup.send(embed=embed)
-
 @bot.tree.command(name="cache", description="View cache statistics")
 async def cache_command(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1330,6 +1700,154 @@ async def cache_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="autobypass_users", description="[ADMIN] Manage auto-bypass authorized users")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    action="Add or remove user",
+    user="User to manage",
+    permission_level="Permission level (auto_bypass, batch, both)"
+)
+async def autobypass_users_command(interaction: discord.Interaction, action: str, user: discord.User, 
+                                   permission_level: str = "auto_bypass"):
+    if interaction.user.id != YOUR_USER_ID:
+        embed = discord.Embed(
+            title="Permission Denied",
+            description="Only the bot owner can manage authorized users.",
+            color=0xFF0000
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    cursor = bot.db_conn.cursor()
+    
+    if action.lower() == "add":
+        can_auto_bypass = 1 if permission_level in ["auto_bypass", "both"] else 0
+        can_use_batch = 1 if permission_level in ["batch", "both"] else 0
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO authorized_users 
+            (user_id, added_by, can_auto_bypass, can_use_batch)
+            VALUES (?, ?, ?, ?)
+        ''', (user.id, interaction.user.id, can_auto_bypass, can_use_batch))
+        
+        bot.db_conn.commit()
+        
+        if can_auto_bypass:
+            bot.auto_bypass_allowed_users.add(user.id)
+        elif user.id in bot.auto_bypass_allowed_users:
+            bot.auto_bypass_allowed_users.remove(user.id)
+        
+        embed = discord.Embed(
+            title="User Authorized",
+            description=f"Added {user.mention} to authorized users.",
+            color=0x00FF00
+        )
+        
+        permissions = []
+        if can_auto_bypass:
+            permissions.append("Auto-Bypass (/autobypass)")
+        if can_use_batch:
+            permissions.append("Batch Command (/batch)")
+        
+        if permissions:
+            embed.add_field(
+                name="Permissions Granted",
+                value="\n".join([f"• {p}" for p in permissions]),
+                inline=False
+            )
+        
+    elif action.lower() == "remove":
+        cursor.execute('DELETE FROM authorized_users WHERE user_id = ?', (user.id,))
+        bot.db_conn.commit()
+        
+        if user.id in bot.auto_bypass_allowed_users:
+            bot.auto_bypass_allowed_users.remove(user.id)
+        
+        embed = discord.Embed(
+            title="User Removed",
+            description=f"Removed {user.mention} from authorized users.",
+            color=0x00FF00
+        )
+        
+    elif action.lower() == "list":
+        cursor.execute('''
+            SELECT user_id, can_auto_bypass, can_use_batch 
+            FROM authorized_users 
+            ORDER BY added_at DESC
+        ''')
+        rows = cursor.fetchall()
+        
+        if rows:
+            users_list = []
+            for row in rows:
+                user_obj = bot.get_user(row['user_id'])
+                username = user_obj.mention if user_obj else f"User {row['user_id']}"
+                
+                permissions = []
+                if row['can_auto_bypass']:
+                    permissions.append("Auto-Bypass")
+                if row['can_use_batch']:
+                    permissions.append("Batch")
+                
+                perm_text = ", ".join(permissions) if permissions else "None"
+                users_list.append(f"• {username} - {perm_text}")
+            
+            embed = discord.Embed(
+                title="Authorized Users List",
+                description="\n".join(users_list),
+                color=0x7289DA
+            )
+        else:
+            embed = discord.Embed(
+                title="Authorized Users List",
+                description="No authorized users found.",
+                color=0xFFA500
+            )
+        
+    else:
+        embed = discord.Embed(
+            title="Invalid Action",
+            description="Use 'add', 'remove', or 'list'.",
+            color=0xFF0000
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="request_access", description="Request access to premium features")
+async def request_access_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Request Access to Premium Features",
+        color=0x7289DA
+    )
+    
+    embed.add_field(
+        name="Available Features",
+        value="• **Auto-Bypass**: Process unlimited links at once\n• **Batch Command**: Process multiple links with one command",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="How to Get Access",
+        value=f"Ask <@{YOUR_USER_ID}> to authorize you in the server.\n\nThey can use: `/autobypass_users add @yourname`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="Current Status",
+        value="✅ **You have access**" if interaction.user.id in bot.auto_bypass_allowed_users else "❌ **You don't have access**",
+        inline=False
+    )
+    
+    if interaction.guild and interaction.guild.id == AUTO_BYPASS_SERVER_ID:
+        if interaction.user.id not in bot.auto_bypass_allowed_users:
+            embed.add_field(
+                name="Quick Request",
+                value=f"Tag <@{YOUR_USER_ID}> in this server to request access!",
+                inline=False
+            )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user or message.author.bot:
@@ -1340,37 +1858,131 @@ async def on_message(message):
         urls = bot.extract_linkvertise_urls(message.content)
         
         if urls:
-            urls = urls[:3]
-            
-            view = discord.ui.View(timeout=300)
-            
-            for i, url in enumerate(urls):
-                if len(url) > 50:
-                    label = f"Bypass Link {i+1}"
-                else:
-                    label = f"Bypass: {url[:30]}..."
+            # Check if user is authorized for auto-bypass
+            if message.author.id in bot.auto_bypass_allowed_users:
+                # Ask if they want to auto-bypass
+                view = discord.ui.View(timeout=60)
                 
-                button = discord.ui.Button(
-                    label=label,
-                    style=discord.ButtonStyle.primary,
-                    custom_id=f"auto_bypass_{i}"
+                button_auto = discord.ui.Button(
+                    label="Auto-Bypass All Links",
+                    style=discord.ButtonStyle.green,
+                    custom_id=f"auto_bypass_all_{message.id}"
                 )
                 
-                async def button_callback(interaction: discord.Interaction, target_url=url):
-                    await bypass_command(interaction, target_url)
+                button_single = discord.ui.Button(
+                    label="Bypass Links Individually",
+                    style=discord.ButtonStyle.blurple,
+                    custom_id=f"bypass_single_{message.id}"
+                )
                 
-                button.callback = button_callback
-                view.add_item(button)
+                async def auto_bypass_callback(interaction: discord.Interaction):
+                    if interaction.user.id != message.author.id:
+                        await interaction.response.send_message(
+                            "Only the original author can use this.", 
+                            ephemeral=True
+                        )
+                        return
+                    
+                    await interaction.response.defer(thinking=True, ephemeral=True)
+                    
+                    # Process all links
+                    successful_urls = await bot.auto_bypass_to_channel(
+                        urls=urls,
+                        user=message.author,
+                        source_guild=message.guild
+                    )
+                    
+                    if successful_urls:
+                        embed = discord.Embed(
+                            title="Auto-Bypass Complete",
+                            description=f"Sent {len(successful_urls)} links to <#{AUTO_BYPASS_CHANNEL_ID}>",
+                            color=0x00FF00
+                        )
+                        await interaction.followup.send(embed=embed, ephemeral=True)
+                        
+                        # Delete the original message if possible
+                        try:
+                            await message.delete()
+                        except:
+                            pass
+                    else:
+                        await interaction.followup.send(
+                            "Auto-bypass failed. Try individual bypass.", 
+                            ephemeral=True
+                        )
+                
+                async def single_bypass_callback(interaction: discord.Interaction):
+                    # Existing single bypass logic
+                    urls_single = urls[:3]
+                    view_single = discord.ui.View(timeout=300)
+                    
+                    for i, url in enumerate(urls_single):
+                        if len(url) > 50:
+                            label = f"Bypass Link {i+1}"
+                        else:
+                            label = f"Bypass: {url[:30]}..."
+                        
+                        button = discord.ui.Button(
+                            label=label,
+                            style=discord.ButtonStyle.primary,
+                            custom_id=f"auto_bypass_{i}_{message.id}"
+                        )
+                        
+                        async def button_callback(interaction: discord.Interaction, target_url=url):
+                            await bypass_command(interaction, target_url)
+                        
+                        button.callback = button_callback
+                        view_single.add_item(button)
+                    
+                    await interaction.response.send_message(
+                        f"Detected {len(urls)} Linkvertise link(s). Click below to bypass:",
+                        view=view_single,
+                        ephemeral=True
+                    )
+                
+                button_auto.callback = auto_bypass_callback
+                button_single.callback = single_bypass_callback
+                
+                view.add_item(button_auto)
+                view.add_item(button_single)
+                
+                response_text = f"<@{message.author.id}>, detected {len(urls)} Linkvertise link(s). Choose an option:"
+                
+            else:
+                # Regular users only get single bypass
+                urls = urls[:3]
+                view = discord.ui.View(timeout=300)
+                
+                for i, url in enumerate(urls):
+                    if len(url) > 50:
+                        label = f"Bypass Link {i+1}"
+                    else:
+                        label = f"Bypass: {url[:30]}..."
+                    
+                    button = discord.ui.Button(
+                        label=label,
+                        style=discord.ButtonStyle.primary,
+                        custom_id=f"auto_bypass_{i}"
+                    )
+                    
+                    async def button_callback(interaction: discord.Interaction, target_url=url):
+                        await bypass_command(interaction, target_url)
+                    
+                    button.callback = button_callback
+                    view.add_item(button)
+                
+                response_text = f"Detected {len(urls)} Linkvertise link(s). Click below to bypass:"
             
             if message.channel.permissions_for(message.guild.me).send_messages:
                 response = await message.reply(
-                    f"Detected {len(urls)} Linkvertise link(s). Click below to bypass:",
+                    response_text,
                     view=view,
                     mention_author=False
                 )
                 
+                # Cleanup after timeout
                 async def cleanup():
-                    await asyncio.sleep(300)
+                    await asyncio.sleep(60 if message.author.id in bot.auto_bypass_allowed_users else 300)
                     try:
                         await response.delete()
                     except:
