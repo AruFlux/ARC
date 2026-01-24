@@ -38,6 +38,9 @@ YOUR_USER_ID = 783542452756938813
 AUTO_BYPASS_CHANNEL_ID = 1464505405815259305
 AUTO_BYPASS_SERVER_ID = 1463101887141249107
 
+# Ping role ID
+PING_ROLE_ID = 1330639211317035089  # Game ping role ID
+
 class BypassMethod(Enum):
     DYNAMIC_DECODE = "dynamic_decode"
     API_BYPASS = "api_bypass"
@@ -109,6 +112,9 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         self.auto_bypass_channel: Optional[discord.TextChannel] = None
         self.auto_bypass_allowed_users: Set[int] = {YOUR_USER_ID}
         
+        # Ping role
+        self.ping_role: Optional[discord.Role] = None
+        
         # Last 24-hour stats timestamp
         self.last_daily_stats_time: Optional[datetime] = None
         
@@ -126,13 +132,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 "Accept-Language": "en-US,en;q=0.9",
             }
         )
-        
-        # Initialize auto-bypass channel
-        self.auto_bypass_channel = self.get_channel(AUTO_BYPASS_CHANNEL_ID)
-        if not self.auto_bypass_channel:
-            guild = self.get_guild(AUTO_BYPASS_SERVER_ID)
-            if guild:
-                self.auto_bypass_channel = guild.get_channel(AUTO_BYPASS_CHANNEL_ID)
         
         # Load authorized users from database
         await self.load_authorized_users()
@@ -353,11 +352,6 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
     async def send_log_to_discord(self, result: BypassResult, user: discord.User, guild: Optional[discord.Guild] = None):
         """Send log to your private Discord channel"""
         if not self.log_channel:
-            guild_obj = self.get_guild(LOG_SERVER_ID)
-            if guild_obj:
-                self.log_channel = guild_obj.get_channel(LOG_CHANNEL_ID) or guild_obj.system_channel
-        
-        if not self.log_channel:
             return
             
         try:
@@ -421,7 +415,13 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             return
         
         try:
+            # Get the ping role mention
+            ping_mention = f"<@&{PING_ROLE_ID}>" if self.ping_role else f"<@&{PING_ROLE_ID}>"
+            
             if len(successful_urls) == 1:
+                # Send ping message first
+                await self.auto_bypass_channel.send(f"{ping_mention} New game file bypassed!")
+                
                 embed = discord.Embed(
                     title="Game File Bypassed",
                     description="File has been successfully bypassed.",
@@ -448,7 +448,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 
                 embed.add_field(
                     name="Status",
-                    value=f"1/{total_attempted} successful",
+                    value=f"✅ 1/{total_attempted} successful",
                     inline=True
                 )
                 
@@ -462,6 +462,9 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                 await self.auto_bypass_channel.send(embed=embed, view=view)
                 
             else:
+                # Send ping message for multiple files
+                await self.auto_bypass_channel.send(f"{ping_mention} {len(successful_urls)} game files bypassed!")
+                
                 for i, final_url in enumerate(successful_urls, 1):
                     embed = discord.Embed(
                         title=f"Game File Bypassed ({i}/{len(successful_urls)})",
@@ -489,7 +492,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                         
                         embed.add_field(
                             name="Status",
-                            value=f"{len(successful_urls)}/{total_attempted} successful",
+                            value=f"✅ {len(successful_urls)}/{total_attempted} successful",
                             inline=True
                         )
                     
@@ -502,7 +505,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
                     
                     await self.auto_bypass_channel.send(embed=embed, view=view)
             
-            logger.info(f"Auto-bypass results sent to channel: {len(successful_urls)} URLs")
+            logger.info(f"Auto-bypass results sent to channel with role ping: {len(successful_urls)} URLs")
             
         except Exception as e:
             logger.error(f"Failed to send auto-bypass results: {e}")
@@ -650,15 +653,57 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
         
         logger.info(f"Bot started with {len(self.guilds)} guilds")
         
+        # ===== LOAD CHANNELS AND ROLES =====
+        # Initialize auto-bypass channel
+        try:
+            guild = self.get_guild(AUTO_BYPASS_SERVER_ID)
+            if guild:
+                self.auto_bypass_channel = guild.get_channel(AUTO_BYPASS_CHANNEL_ID)
+                if self.auto_bypass_channel:
+                    logger.info(f"Auto-bypass channel loaded: #{self.auto_bypass_channel.name}")
+                else:
+                    logger.warning(f"Auto-bypass channel not found in guild. ID: {AUTO_BYPASS_CHANNEL_ID}")
+                    
+                    # Try to force fetch the channel
+                    try:
+                        channel = await self.fetch_channel(AUTO_BYPASS_CHANNEL_ID)
+                        if isinstance(channel, discord.TextChannel):
+                            self.auto_bypass_channel = channel
+                            logger.info(f"Force-fetched auto-bypass channel: #{channel.name}")
+                    except Exception as fetch_error:
+                        logger.error(f"Failed to fetch auto-bypass channel: {fetch_error}")
+            else:
+                logger.warning(f"Auto-bypass guild not found. ID: {AUTO_BYPASS_SERVER_ID}")
+        except Exception as e:
+            logger.error(f"Failed to load auto-bypass channel: {e}")
+        
+        # Initialize ping role
+        if self.auto_bypass_channel and self.auto_bypass_channel.guild:
+            self.ping_role = self.auto_bypass_channel.guild.get_role(PING_ROLE_ID)
+            if self.ping_role:
+                logger.info(f"Ping role loaded: @{self.ping_role.name}")
+            else:
+                logger.warning(f"Ping role not found. ID: {PING_ROLE_ID}")
+        
+        # Initialize log channel
+        try:
+            log_guild = self.get_guild(LOG_SERVER_ID)
+            if log_guild:
+                self.log_channel = log_guild.get_channel(LOG_CHANNEL_ID) or log_guild.system_channel
+                if self.log_channel:
+                    logger.info(f"Log channel loaded: #{self.log_channel.name}")
+                else:
+                    logger.warning(f"Log channel not found in guild. ID: {LOG_CHANNEL_ID}")
+            else:
+                logger.warning(f"Log guild not found. ID: {LOG_SERVER_ID}")
+        except Exception as e:
+            logger.error(f"Failed to load log channel: {e}")
+        # ===== END OF CHANNEL LOADING =====
+        
         await self.send_startup_notification()
     
     async def send_startup_notification(self):
         """Send startup notification to log channel"""
-        if not self.log_channel:
-            guild_obj = self.get_guild(LOG_SERVER_ID)
-            if guild_obj:
-                self.log_channel = guild_obj.get_channel(LOG_CHANNEL_ID) or guild_obj.system_channel
-        
         if self.log_channel:
             embed = discord.Embed(
                 title="Bot Started",
@@ -668,8 +713,15 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             )
             embed.add_field(name="Bot User", value=f"{self.user} ({self.user.id})", inline=True)
             embed.add_field(name="Database", value="Connected" if self.db_conn else "Disabled", inline=True)
-            embed.add_field(name="Auto-bypass Channel", value="Connected" if self.auto_bypass_channel else "Not found", inline=True)
+            embed.add_field(name="Auto-bypass Channel", 
+                           value=f"✅ Connected: #{self.auto_bypass_channel.name}" if self.auto_bypass_channel else "❌ Not found", 
+                           inline=True)
+            embed.add_field(name="Ping Role", 
+                           value=f"✅ Loaded: @{self.ping_role.name}" if self.ping_role else "❌ Not found", 
+                           inline=True)
             await self.log_channel.send(embed=embed)
+        else:
+            logger.warning("Log channel not available for startup notification")
     
     def get_cache_key(self, url: str) -> str:
         normalized = url.lower().strip()
@@ -1153,6 +1205,152 @@ async def bypass_command(interaction: discord.Interaction, url: str):
         )
         await interaction.followup.send(embed=embed)
         return
+    
+    allowed, reset_time, error_msg = bot.check_rate_limit(interaction.user.id)
+    if not allowed:
+        embed = discord.Embed(
+            title="Rate Limited",
+            description=error_msg or f"Please wait {reset_time} seconds.",
+            color=0xFFA500
+        )
+        embed.set_footer(text=f"Daily limit: {bot.DAILY_LIMIT} requests")
+        await interaction.followup.send(embed=embed)
+        return
+    
+    result = await bot.bypass_linkvertise(
+        url=url,
+        user_id=interaction.user.id,
+        guild_id=interaction.guild.id if interaction.guild else None
+    )
+    
+    await bot.log_to_database(result, interaction.user, interaction.guild)
+    await bot.send_log_to_discord(result, interaction.user, interaction.guild)
+    
+    if result.success:
+        embed = discord.Embed(
+            title="Bypass Successful",
+            color=0x00FF00,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="Original Link",
+            value=f"```{url[:100] + '...' if len(url) > 100 else url}```",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Direct Link",
+            value=f"```{result.url[:100] + '...' if len(result.url) > 100 else result.url}```",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Method",
+            value=f"`{result.method.value.replace('_', ' ').title()}`",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Time",
+            value=f"`{result.execution_time:.2f}s`",
+            inline=True
+        )
+        
+        if interaction.user.id not in bot.auto_bypass_allowed_users:
+            embed.add_field(
+                name="Want More Features?",
+                value=f"Get access to **/autobypass** and **/batch** commands!\nUse `/request_access` to learn how.",
+                inline=False
+            )
+        
+        embed.set_footer(
+            text=f"Requested by {interaction.user.name}",
+            icon_url=interaction.user.display_avatar.url
+        )
+        
+        view = discord.ui.View(timeout=180)
+        view.add_item(discord.ui.Button(
+            label="Open Direct Link",
+            url=result.url,
+            style=discord.ButtonStyle.link
+        ))
+        
+        # Also send to auto-bypass channel if user is authorized
+        if interaction.user.id in bot.auto_bypass_allowed_users and bot.auto_bypass_channel:
+            try:
+                # Send ping message
+                ping_mention = f"<@&{PING_ROLE_ID}>" if bot.ping_role else f"<@&{PING_ROLE_ID}>"
+                await bot.auto_bypass_channel.send(f"{ping_mention} Game file bypassed via command!")
+                
+                embed_channel = discord.Embed(
+                    title="Game File Bypassed",
+                    description="File has been successfully bypassed.",
+                    color=0x00FF00,
+                    timestamp=datetime.utcnow()
+                )
+                
+                display_url = result.url
+                if len(display_url) > 200:
+                    display_url = display_url[:197] + "..."
+                
+                embed_channel.add_field(
+                    name="Direct Link",
+                    value=f"```{display_url}```",
+                    inline=False
+                )
+                
+                embed_channel.add_field(
+                    name="Bypassed By",
+                    value=f"{interaction.user.mention} ({interaction.user.id})",
+                    inline=True
+                )
+                
+                embed_channel.add_field(
+                    name="Source",
+                    value=f"Via `/bypass` in {interaction.guild.name}",
+                    inline=True
+                )
+                
+                view_channel = discord.ui.View(timeout=None)
+                view_channel.add_item(discord.ui.Button(
+                    label="Open Direct Link",
+                    url=result.url,
+                    style=discord.ButtonStyle.link
+                ))
+                
+                await bot.auto_bypass_channel.send(embed=embed_channel, view=view_channel)
+                
+            except Exception as e:
+                logger.error(f"Failed to send to auto-bypass channel: {e}")
+        
+        await interaction.followup.send(embed=embed, view=view)
+        
+    else:
+        embed = discord.Embed(
+            title="Bypass Failed",
+            description=result.message,
+            color=0xFF0000,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="URL",
+            value=f"```{url[:150] if len(url) > 150 else url}```",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Method Tried",
+            value=f"`{result.method.value.replace('_', ' ').title()}`",
+            inline=True
+        )
+        
+        embed.set_footer(text="Try again with a different link")
+        
+        await interaction.followup.send(embed=embed)
+
+# ============ PBYPASS COMMAND ============
 @bot.tree.command(name="pbypass", description="PRIVATE bypass - Bypass links without sending to channel")
 @app_commands.describe(url="The Linkvertise URL to bypass privately")
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: (i.guild_id, i.user.id) if i.guild_id else i.user.id)
@@ -1287,147 +1485,8 @@ async def pbypass_error(interaction: discord.Interaction, error):
             color=0xFF0000
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    allowed, reset_time, error_msg = bot.check_rate_limit(interaction.user.id)
-    if not allowed:
-        embed = discord.Embed(
-            title="Rate Limited",
-            description=error_msg or f"Please wait {reset_time} seconds.",
-            color=0xFFA500
-        )
-        embed.set_footer(text=f"Daily limit: {bot.DAILY_LIMIT} requests")
-        await interaction.followup.send(embed=embed)
-        return
-    
-    result = await bot.bypass_linkvertise(
-        url=url,
-        user_id=interaction.user.id,
-        guild_id=interaction.guild.id if interaction.guild else None
-    )
-    
-    await bot.log_to_database(result, interaction.user, interaction.guild)
-    await bot.send_log_to_discord(result, interaction.user, interaction.guild)
-    
-    if result.success:
-        embed = discord.Embed(
-            title="Bypass Successful",
-            color=0x00FF00,
-            timestamp=datetime.utcnow()
-        )
-        
-        embed.add_field(
-            name="Original Link",
-            value=f"```{url[:100] + '...' if len(url) > 100 else url}```",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Direct Link",
-            value=f"```{result.url[:100] + '...' if len(result.url) > 100 else result.url}```",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Method",
-            value=f"`{result.method.value.replace('_', ' ').title()}`",
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Time",
-            value=f"`{result.execution_time:.2f}s`",
-            inline=True
-        )
-        
-        if interaction.user.id not in bot.auto_bypass_allowed_users:
-            embed.add_field(
-                name="Want More Features?",
-                value=f"Get access to **/autobypass** and **/batch** commands!\nUse `/request_access` to learn how.",
-                inline=False
-            )
-        
-        embed.set_footer(
-            text=f"Requested by {interaction.user.name}",
-            icon_url=interaction.user.display_avatar.url
-        )
-        
-        view = discord.ui.View(timeout=180)
-        view.add_item(discord.ui.Button(
-            label="Open Direct Link",
-            url=result.url,
-            style=discord.ButtonStyle.link
-        ))
-        
-        # Also send to auto-bypass channel if user is authorized
-        if interaction.user.id in bot.auto_bypass_allowed_users and bot.auto_bypass_channel:
-            try:
-                embed_channel = discord.Embed(
-                    title="Game File Bypassed",
-                    description="File has been successfully bypassed.",
-                    color=0x00FF00,
-                    timestamp=datetime.utcnow()
-                )
-                
-                display_url = result.url
-                if len(display_url) > 200:
-                    display_url = display_url[:197] + "..."
-                
-                embed_channel.add_field(
-                    name="Direct Link",
-                    value=f"```{display_url}```",
-                    inline=False
-                )
-                
-                embed_channel.add_field(
-                    name="Bypassed By",
-                    value=f"{interaction.user.mention} ({interaction.user.id})",
-                    inline=True
-                )
-                
-                embed_channel.add_field(
-                    name="Source",
-                    value=f"Via `/bypass` in {interaction.guild.name}",
-                    inline=True
-                )
-                
-                view_channel = discord.ui.View(timeout=None)
-                view_channel.add_item(discord.ui.Button(
-                    label="Open Direct Link",
-                    url=result.url,
-                    style=discord.ButtonStyle.link
-                ))
-                
-                await bot.auto_bypass_channel.send(embed=embed_channel, view=view_channel)
-                
-            except Exception as e:
-                logger.error(f"Failed to send to auto-bypass channel: {e}")
-        
-        await interaction.followup.send(embed=embed, view=view)
-        
-    else:
-        embed = discord.Embed(
-            title="Bypass Failed",
-            description=result.message,
-            color=0xFF0000,
-            timestamp=datetime.utcnow()
-        )
-        
-        embed.add_field(
-            name="URL",
-            value=f"```{url[:150] if len(url) > 150 else url}```",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Method Tried",
-            value=f"`{result.method.value.replace('_', ' ').title()}`",
-            inline=True
-        )
-        
-        embed.set_footer(text="Try again with a different link")
-        
-        await interaction.followup.send(embed=embed)
 
+# ============ EXISTING ERROR HANDLER ============
 @bypass_command.error
 async def bypass_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.CommandOnCooldown):
@@ -1968,7 +2027,7 @@ async def request_access_command(interaction: discord.Interaction):
     
     embed.add_field(
         name="Current Status",
-        value="**You have access**" if interaction.user.id in bot.auto_bypass_allowed_users else "❌ **You don't have access**",
+        value="✅ **You have access**" if interaction.user.id in bot.auto_bypass_allowed_users else "❌ **You don't have access**",
         inline=False
     )
     
