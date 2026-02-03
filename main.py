@@ -2874,12 +2874,12 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     
-    token = os.getenv('DISCORD_BOT_TOKEN')
+    token = os.getenv('D_TOKEN')
     
     if not token:
-        logger.error("No bot token found. Please set DISCORD_BOT_TOKEN in .env file")
+        logger.error("No bot token found. Please set D_TOKEN in .env file")
         print("Error: No bot token found.")
-        print("Create a .env file with: DISCORD_BOT_TOKEN=your_token_here")
+        print("Create a .env file with: D_TOKEN=your_token_here")
         exit(1)
     
     try:
