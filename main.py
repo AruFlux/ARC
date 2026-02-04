@@ -264,9 +264,9 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
 
             loaded = 0
             for row in cursor.fetchall():
-                cache_key = row['url_hash']
-                bypassed_url = row['bypassed_url']
-                method = BypassMethod(row['method'])
+                cache_key = row[0]  # url_hash
+                bypassed_url = row[1]  # bypassed_url
+                method = BypassMethod(row[2])  # method
 
                 self.cache[cache_key] = (bypassed_url, time.time(), method)
                 self.cache_order.append(cache_key)
@@ -307,7 +307,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             rows = cursor.fetchall()
 
             for row in rows:
-                self.auto_bypass_allowed_users.add(row['user_id'])
+                self.auto_bypass_allowed_users.add(row[0])  # user_id
 
             logger.info(f"Loaded {len(rows)} authorized users from database")
 
@@ -512,7 +512,7 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             if result.success:
                 self.performance_stats["successful_requests"] += 1
             self.performance_stats["success_rate"] = (
-                self.performance_stats["successful_requests"] / self.performance_stats["total_requests"]
+                self.performance_stats["successful_requests"] / max(self.performance_stats["total_requests"], 1)
             ) * 100
 
             alpha = 0.1
@@ -785,28 +785,26 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
 
             cursor.execute('''
                 SELECT 
-                    COALESCE(COUNT(*), 0) as total_requests,
-                    COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) as successful_requests,
-                    COALESCE(COUNT(DISTINCT user_id), 0) as unique_users,
-                    COALESCE(COUNT(DISTINCT guild_id), 0) as unique_servers
+                    COUNT(*) as total_requests,
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_requests,
+                    COUNT(DISTINCT user_id) as unique_users,
+                    COUNT(DISTINCT guild_id) as unique_servers
                 FROM bypass_logs 
                 WHERE timestamp >= ?
             ''', (twenty_four_hours_ago,))
 
-            stats = cursor.fetchone()
-
-            if not stats:
-                stats = {
-                    'total_requests': 0,
-                    'successful_requests': 0,
-                    'unique_users': 0,
-                    'unique_servers': 0
-                }
-
-            total_requests = stats.get('total_requests', 0)
-            successful_requests = stats.get('successful_requests', 0)
-            unique_users = stats.get('unique_users', 0)
-            unique_servers = stats.get('unique_servers', 0)
+            row = cursor.fetchone()
+            
+            if row:
+                total_requests = row[0] or 0
+                successful_requests = row[1] or 0
+                unique_users = row[2] or 0
+                unique_servers = row[3] or 0
+            else:
+                total_requests = 0
+                successful_requests = 0
+                unique_users = 0
+                unique_servers = 0
 
             cursor.execute('''
                 SELECT username, COUNT(*) as request_count 
@@ -846,11 +844,11 @@ class EnhancedLinkvertiseBypassBot(commands.Bot):
             embed.add_field(name="Memory Cache", value=f"{len(self.cache):,} entries", inline=True)
 
             if method_counts:
-                methods_text = "\n".join([f"• {row['method']}: {row['count']:,}" for row in method_counts])
+                methods_text = "\n".join([f"• {method_row[0]}: {method_row[1]:,}" for method_row in method_counts])
                 embed.add_field(name="Methods Used", value=methods_text, inline=False)
 
             if top_users:
-                top_users_text = "\n".join([f"• {row['username']}: {row['request_count']:,}" for row in top_users])
+                top_users_text = "\n".join([f"• {user_row[0]}: {user_row[1]:,}" for user_row in top_users])
                 embed.add_field(name="Top Users (24 Hours)", value=top_users_text, inline=False)
 
             embed.add_field(
@@ -2190,7 +2188,7 @@ async def batch_command(interaction: discord.Interaction, links: str):
 
     user_data = cursor.fetchone()
 
-    if interaction.user.id != YOUR_USER_ID and (not user_data or not user_data['can_use_batch']):
+    if interaction.user.id != YOUR_USER_ID and (not user_data or not user_data[0]):
         embed = discord.Embed(
             title="Access Denied",
             description="You need authorization to use the batch command.",
@@ -2560,13 +2558,13 @@ async def autobypass_users_command(interaction: discord.Interaction, action: str
         if rows:
             users_list = []
             for row in rows:
-                user_obj = bot.get_user(row['user_id'])
-                username = user_obj.mention if user_obj else f"User {row['user_id']}"
+                user_obj = bot.get_user(row[0])
+                username = user_obj.mention if user_obj else f"User {row[0]}"
 
                 permissions = []
-                if row['can_auto_bypass']:
+                if row[1]:
                     permissions.append("Auto-Bypass")
-                if row['can_use_batch']:
+                if row[2]:
                     permissions.append("Batch")
 
                 perm_text = ", ".join(permissions) if permissions else "None"
